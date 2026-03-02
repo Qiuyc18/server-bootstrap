@@ -35,5 +35,8 @@ else
   echo "SSH 密钥已存在，跳过"
 fi
 
+echo "==== 4. 安装 uv ===="
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 echo "==== 完成 ===="
 echo "重新打开终端，或者执行：source ~/.bashrc"
