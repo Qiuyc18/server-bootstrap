@@ -37,6 +37,7 @@ fi
 
 echo "==== 4. 安装 uv ===="
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
 
 echo "==== 完成 ===="
-echo "重新打开终端，或者执行：source ~/.bashrc"
+source ~/.bashrc"
