@@ -82,20 +82,17 @@ def _is_endpoint_reachable(endpoint: str, timeout: int = 5) -> bool:
 
 
 def _configure_hf_endpoint_or_exit() -> None:
-    print(f"连通性测试: 主站 {HF_PRIMARY_ENDPOINT}")
-    if _is_endpoint_reachable(HF_PRIMARY_ENDPOINT):
-        os.environ.pop("HF_ENDPOINT", None)
-        print("连通性测试结果: 主站可用，使用官方站点。")
-        return
-
     print(f"连通性测试: 镜像站 {HF_MIRROR_ENDPOINT}")
     if _is_endpoint_reachable(HF_MIRROR_ENDPOINT):
         os.environ["HF_ENDPOINT"] = HF_MIRROR_ENDPOINT
-        print(f"连通性测试结果: 主站不可用，已切换到镜像站 {HF_MIRROR_ENDPOINT}")
+        print("连通性测试结果: 镜像站可用")
         return
-
-    print("连通性测试结果: 主站与镜像站均不可达，脚本退出。")
-    raise SystemExit(1)
+    else:
+        print(f"连通性测试: 主站 {HF_PRIMARY_ENDPOINT}")
+        if _is_endpoint_reachable(HF_PRIMARY_ENDPOINT):
+            os.environ.pop("HF_ENDPOINT", None)
+            print("连通性测试结果: 主站可用，使用官方站点。")
+            return
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
