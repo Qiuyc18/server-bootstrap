@@ -2,6 +2,9 @@
 import argparse
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from textwrap import dedent
 
@@ -13,6 +16,8 @@ dotenv.load_dotenv()
 # --- 从环境变量读取默认路径，若未设置则使用默认值 ---
 DEFAULT_MODEL_DIR = os.getenv("DEFAULT_MODEL_DIR", "/etc/moreh/checkpoint/")
 DEFAULT_DATA_DIR = os.getenv("DEFAULT_DATA_DIR", "/etc/moreh/checkpoint/data/")
+HF_PRIMARY_ENDPOINT = "https://huggingface.co"
+HF_MIRROR_ENDPOINT = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
 
 # --- 文档说明 ---
 DESCRIPTION_TEXT = dedent(f"""\
@@ -63,6 +68,36 @@ def _get_token(token: str | None = None) -> str | None:
     )
 
 
+def _is_endpoint_reachable(endpoint: str, timeout: int = 5) -> bool:
+    probe_url = urllib.parse.urljoin(endpoint.rstrip("/") + "/", "api/models?limit=1")
+    request = urllib.request.Request(probe_url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as err:
+        # 4xx 表示服务可达但请求被拒绝，也视为网络连通。
+        return 400 <= err.code < 500
+    except Exception:
+        return False
+
+
+def _configure_hf_endpoint_or_exit() -> None:
+    print(f"连通性测试: 主站 {HF_PRIMARY_ENDPOINT}")
+    if _is_endpoint_reachable(HF_PRIMARY_ENDPOINT):
+        os.environ.pop("HF_ENDPOINT", None)
+        print("连通性测试结果: 主站可用，使用官方站点。")
+        return
+
+    print(f"连通性测试: 镜像站 {HF_MIRROR_ENDPOINT}")
+    if _is_endpoint_reachable(HF_MIRROR_ENDPOINT):
+        os.environ["HF_ENDPOINT"] = HF_MIRROR_ENDPOINT
+        print(f"连通性测试结果: 主站不可用，已切换到镜像站 {HF_MIRROR_ENDPOINT}")
+        return
+
+    print("连通性测试结果: 主站与镜像站均不可达，脚本退出。")
+    raise SystemExit(1)
+
+
 def _cmd_search(args: argparse.Namespace) -> int:
     try:
         from huggingface_hub import HfApi
@@ -110,8 +145,6 @@ def _cmd_download(args: argparse.Namespace) -> int:
             "repo_id": args.repo_id,
             "repo_type": args.type,  # 关键点：告诉 HF 下载的是模型还是数据集
             "local_dir": local_dir,
-            "local_dir_use_symlinks": False,
-            "resume_download": True,
             "token": token,
             "max_workers": 8,
         }
@@ -129,6 +162,8 @@ def _cmd_download(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    _configure_hf_endpoint_or_exit()
+
     parser = argparse.ArgumentParser(
         description=DESCRIPTION_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
