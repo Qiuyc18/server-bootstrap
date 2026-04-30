@@ -1,0 +1,86 @@
+### 通用Python项目忽略项 ###
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.env
+.venv
+
+# IDE配置
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS相关
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+### Jupyter Notebook 控制 ###
+.ipynb_checkpoints/
+*.ipynb
+# 可选：仅忽略输出，保留代码（需配合nbstripout等工具）
+# !*.ipynb  # 若选择性提交，则取消此行
+
+### 日志与运行时输出 ###
+logs/
+log/
+*.log
+*.trace
+runtime_metrics.json
+
+### 模型与训练产物 ###
+model/
+models/
+checkpoints/
+weights/
+saved_models/
+model.pth
+*.pt
+*.pth.tar
+*.ckpt
+best_model/*
+outputs/
+charts/
+
+### 容器环境特有忽略 ###
+# Docker内Jupyter临时目录
+/tmp/notebook_runtime/
+/run/user/*
+
+# SSH临时密钥（动态生成）
+ssh/*.tmpkey
+ssh/known_hosts.tmp
+
+# CUDA共享内存临时文件（罕见）
+/dev/shm/cuda_*
+
+# 镜像内置示例输出
+examples/output/
+examples/results/
+
+### 开发辅助工具 ###
+# TensorBoard日志
+runs/
+tensorboard/
+# Wandb
+wandb/
+
+
+### 版本控制自身保护 ###
+!.gitkeep
+# 使用.gitkeep保留空目录结构，但不跟踪其他内容
+
+### 参考代码 ###
+verl-src/
