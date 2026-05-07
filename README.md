@@ -7,12 +7,12 @@
 | 文件 | 说明 |
 |------|------|
 | `init.sh` | 通用 Debian/Ubuntu：基础包、[ble.sh](https://github.com/akinomyoga/ble.sh)、[Oh My Bash](https://github.com/ohmybash/oh-my-bash)、`~/.ssh/id_ed25519`（若不存在）、[uv](https://docs.astral.sh/uv/) |
-| `init_on_amd.sh` | 在通用步骤基础上安装 OpenMPI，用 uv 创建 `~/envs/vllm-rocm` 虚拟环境并安装带 ROCm nightly 源的 **vLLM**（不生成 SSH 密钥；需本机具备可用的 ROCm / AMD 使用场景） |
+| `init_on_amd.sh` | 在通用步骤基础上安装 Docker、OpenMPI，并写入 **vLLM ROCm 7 Docker** 相关配置（默认镜像 [`rocm/vllm-dev`](https://hub.docker.com/r/rocm/vllm-dev/tags)）。适用于宿主机仍为 ROCm 6.x（如 mi250-002）而 wheel 需 ROCm 7 的场景，避免裸机升级 ROCm；不生成 SSH 密钥 |
 | `download.py` | 基于 [huggingface-hub](https://huggingface.co/docs/huggingface_hub) 的 `search` / `download`，可选镜像与 Token |
 
 ## 系统要求
 
-- **Shell 脚本**：带 `apt` 的发行版（如 Debian、Ubuntu），当前用户有 `sudo`，网络可访问 GitHub、astral.sh；`init_on_amd.sh` 还会访问 vLLM 的 ROCm nightly 索引。
+- **Shell 脚本**：带 `apt` 的发行版（如 Debian、Ubuntu），当前用户有 `sudo`，网络可访问 GitHub、astral.sh；`init_on_amd.sh` 会安装 `docker.io` 并配置 `vllm_rocm_shell`（需能拉取 Docker Hub 上的 `rocm/vllm-dev`）。
 - **Python 工具**：Python ≥ 3.10；推荐用本仓库的 [uv](https://docs.astral.sh/uv/) 管理依赖。
 
 ## 一键安装（远程 raw）
@@ -23,7 +23,7 @@
 curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init.sh | bash
 ```
 
-AMD / ROCm + vLLM 环境（请确认目标机器与驱动栈符合你的需求后再执行）：
+AMD 服务器：Shell、uv、Docker，以及 **vLLM 官方 ROCm 7 容器** 的本地参数（见脚本内 mi250-002 / ROCm 6.x 与 rocm722 wheel 的说明）。安装后请编辑 `~/.config/server-bootstrap/vllm-rocm.env` 中的镜像 tag，执行 `docker pull`，再用 `vllm_rocm_shell` 进入容器。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init_on_amd.sh | bash
