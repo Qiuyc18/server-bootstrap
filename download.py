@@ -55,7 +55,7 @@ def _read_env_token(env_path: Path) -> str | None:
 def _get_token(token: str | None = None) -> str | None:
     if token:
         return token
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parent
     token = _read_env_token(repo_root / ".env") or os.environ.get(
         "HUGGINGFACE_API_TOKEN"
     )
