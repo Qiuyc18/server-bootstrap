@@ -1,0 +1,10 @@
+[project]
+name = "server-bootstrap"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dotenv>=0.9.9",
+    "huggingface-hub>=1.12.2",
+]
