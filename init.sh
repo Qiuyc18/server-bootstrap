@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 非交互 apt：避免 needrestart / 内核待重启 等 whiptail 在 SSH 里弹窗
+apt_get() {
+  sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
+}
+
 echo "==== 1. 安装基础工具 ===="
-sudo apt update
-sudo apt install -y curl git xz-utils ca-certificates openssh-client
+apt_get update
+apt_get install -y curl git xz-utils ca-certificates openssh-client
 
 echo "==== 2. 安装 ble.sh ===="
 

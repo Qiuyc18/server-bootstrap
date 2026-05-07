@@ -7,16 +7,19 @@
 #
 set -euo pipefail
 
+# 非交互 apt：避免 needrestart / 内核待重启 等 whiptail 在 SSH 里弹窗（见 README 说明）
+apt_get() {
+  sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
+}
+
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/server-bootstrap"
 ENV_FILE="${CONFIG_DIR}/vllm-rocm.env"
 DOCKER_RC="${CONFIG_DIR}/vllm-rocm-docker.sh"
 BASHRC_MARKER="# server-bootstrap: vllm-rocm-docker (managed)"
 
 echo "==== 1. 安装基础工具 ===="
-sudo apt update
-sudo apt install -y curl git xz-utils ca-certificates openssh-client
-sudo apt install -y openmpi-bin libopenmpi-dev
-sudo apt install -y docker.io
+apt_get update
+apt_get install -y curl git xz-utils ca-certificates openssh-client openmpi-bin libopenmpi-dev docker.io
 sudo ldconfig
 
 if command -v systemctl >/dev/null 2>&1; then

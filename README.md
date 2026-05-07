@@ -31,6 +31,14 @@ curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init_
 
 使用自己的 fork 或分支时，将 URL 中的 `Qiuyc18/server-bootstrap` 与 `main` 改成你的仓库与分支名即可。
 
+## 常见问题
+
+### 运行脚本时出现「Pending kernel upgrade / Newer kernel available」
+
+磁盘里已经安装了比**当前正在运行**的内核更新的 `linux-image`（例如提示里：运行中是 `5.15.0-25`，系统期望/已安装的是 `5.15.0-176`），多半是以前做过 `apt upgrade` 但**还没重启**。本次脚本里的 `apt-get install` 会触发 `needrestart`、更新通知等钩子，于是用 whiptail 提醒你重启。
+
+**怎么处理**：能在维护窗口重启时执行 `sudo reboot`，让新内核生效；暂时不能重启就选「确定」关掉对话框即可，一般不影响本次包安装。仓库里的 `init.sh` / `init_on_amd.sh` 已对 `apt-get` 传入 `DEBIAN_FRONTEND=noninteractive` 和 `NEEDRESTART_MODE=a`，尽量不在 SSH 里再弹交互窗；要彻底消除「已装内核 ≠ 运行内核」的状态，仍需要在方便时重启一次。
+
 ## 安装完成后
 
 重新登录，或执行：
