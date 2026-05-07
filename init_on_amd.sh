@@ -12,6 +12,7 @@ apt_get() {
   sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
 }
 
+NEEDRESTART_MODE=l
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/server-bootstrap"
 ENV_FILE="${CONFIG_DIR}/vllm-rocm.env"
 DOCKER_RC="${CONFIG_DIR}/vllm-rocm-docker.sh"
@@ -44,6 +45,7 @@ if [ ! -d "$HOME/.local/share/blesh" ]; then
   tar xJf ble-nightly.tar.xz
   bash ble-nightly/ble.sh --install "$HOME/.local/share"
   rm -rf "$tmpdir"
+  cd "$HOME"
 else
   echo "ble.sh 已存在，跳过"
 fi

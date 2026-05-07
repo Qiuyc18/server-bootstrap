@@ -23,6 +23,7 @@ if [ ! -d "$HOME/.local/share/blesh" ]; then
   tar xJf ble-nightly.tar.xz
   bash ble-nightly/ble.sh --install "$HOME/.local/share"
   rm -rf "$tmpdir"
+  cd "$HOME"
 else
   echo "ble.sh 已存在，跳过"
 fi

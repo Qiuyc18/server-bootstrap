@@ -39,6 +39,12 @@ curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init_
 
 **怎么处理**：能在维护窗口重启时执行 `sudo reboot`，让新内核生效；暂时不能重启就选「确定」关掉对话框即可，一般不影响本次包安装。仓库里的 `init.sh` / `init_on_amd.sh` 已对 `apt-get` 传入 `DEBIAN_FRONTEND=noninteractive` 和 `NEEDRESTART_MODE=a`，尽量不在 SSH 里再弹交互窗；要彻底消除「已装内核 ≠ 运行内核」的状态，仍需要在方便时重启一次。
 
+**对话框里怎么选 OK**：这类界面一般是 **whiptail**。焦点在「OK」上时直接按 **Enter** 即可；若焦点在别的按钮上，用 **Tab**（或左右方向键）切到 **OK**，再按 **Enter**。不要用鼠标点（纯终端里通常无效）。若怎么按键都没反应，多半是 SSH/终端未把键盘交给该界面，可另开一个普通 SSH 会话再操作，或先 **Ctrl+C** 中断当前 `apt`（可能留下半装状态，需谨慎），换用已更新脚本的 `curl … | bash` 重跑以减少弹窗。
+
+### `git clone` 报 `Unable to read current working directory`
+
+安装 ble.sh 时脚本会 `cd` 到临时目录再 `rm -rf` 删掉它，若未立刻 `cd` 回有效路径，当前目录会变成「已删除的目录」，后面的 `git clone`（Oh My Bash）就会失败。请使用已修复的 `init.sh` / `init_on_amd.sh`（删除临时目录后会 `cd "$HOME"`）；若已手动装了一半，可先 `cd ~` 再重新执行脚本或单独 `git clone` Oh My Bash。
+
 ## 安装完成后
 
 重新登录，或执行：
