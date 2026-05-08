@@ -8,7 +8,7 @@ apt_get() {
 
 echo "==== 1. 安装基础工具 ===="
 apt_get update
-apt_get install -y curl git xz-utils ca-certificates openssh-client
+apt_get install -y curl git xz-utils ca-certificates openssh-client ffmpeg
 
 echo "==== 2. 安装 ble.sh ===="
 
