@@ -23,6 +23,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
 
 MODE="bash"
+FORCE_RECREATE=0
 
 # =========================
 # Help
@@ -45,7 +46,12 @@ Options:
                              Default: ${PORT}
   --hip_devices <ids>        HIP_VISIBLE_DEVICES, for example 0 or 0,1
                              Default: ${HIP_DEVICES}
+  --force-recreate           Remove existing container named CONTAINER_NAME and create a new one
   -h, --help                 Show this help
+
+If a container with the same CONTAINER_NAME already exists:
+  - running: attach with \`docker exec\` (bash) instead of failing
+  - stopped: \`docker start -ai\` to resume
 
 Examples:
   ./run_vllm_docker.sh --code_space ~/server-bootstrap
@@ -94,6 +100,10 @@ while [[ $# -gt 0 ]]; do
     --hip_devices|--hip-devices)
       HIP_DEVICES="$2"
       shift 2
+      ;;
+    --force-recreate)
+      FORCE_RECREATE=1
+      shift
       ;;
     -h|--help)
       usage
@@ -154,6 +164,30 @@ echo "Model path:             ${MODEL_PATH}"
 echo "Served model name:      ${SERVED_MODEL_NAME}"
 echo "Port:                   ${PORT}"
 echo
+
+# =========================
+# Reuse existing container (same name)
+# =========================
+
+if docker container inspect "${CONTAINER_NAME}" &>/dev/null; then
+  if [[ "${FORCE_RECREATE}" -eq 1 ]]; then
+    echo "[INFO] Removing existing container: ${CONTAINER_NAME}"
+    docker rm -f "${CONTAINER_NAME}" >/dev/null
+  else
+    running="$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}")"
+    if [[ "${running}" == "true" ]]; then
+      echo "[INFO] Container ${CONTAINER_NAME} is already running; opening a new shell inside it."
+      if [[ "${MODE}" == "serve" ]]; then
+        echo "[WARN] --serve ignored: an instance with this name is already running."
+        echo "[WARN] To replace it, run with --force-recreate (stops and removes the container)."
+      fi
+      exec docker exec -it -w "${WORKDIR}" "${CONTAINER_NAME}" bash
+    else
+      echo "[INFO] Starting existing stopped container: ${CONTAINER_NAME}"
+      exec docker start -ai "${CONTAINER_NAME}"
+    fi
+  fi
+fi
 
 # =========================
 # Docker run
