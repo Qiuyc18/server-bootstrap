@@ -7,23 +7,29 @@ This module deliberately does **not** call modelscope-hub's
 HTTP 200. Instead we:
 
 * list files via a narrow Hub API adapter;
-* download with strict ``206`` + ``Content-Range`` validation;
+* download with strict Range response/header/body validation;
+* accept ModelScope's non-standard HTTP 200 only when every Range invariant matches;
+* lock the destination directory across processes;
 * keep byte-range parts that survive process restarts;
 * merge to a temp file, verify size/SHA256, then ``os.replace`` into place.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import logging
 import os
 import random
 import re
 import shutil
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Callable
 
@@ -45,6 +51,7 @@ DEFAULT_CHUNK_SIZE = 1024 * 1024
 LEGACY_INCOMPLETE_SUFFIX = ".incomplete"
 PARTS_DIR_NAME = ".ms_parts"
 MERGE_SUFFIX = ".ms_merging"
+DOWNLOAD_LOCK_NAME = ".modelscope_safe_download.lock"
 LEGACY_PART_RE = re.compile(r"^(.+)_(\d+)_(\d+)$")
 CONTENT_RANGE_RE = re.compile(
     r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE
@@ -110,6 +117,46 @@ def _shutdown_cancel_futures(
     for fut in futures:
         fut.cancel()
     pool.shutdown(wait=True, cancel_futures=True)
+
+
+@contextmanager
+def cross_process_download_lock(local_dir: Path):
+    """Prevent multiple processes from mutating one download directory."""
+    local_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = local_dir / DOWNLOAD_LOCK_NAME
+    lock_file = lock_path.open("a+b")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.seek(0)
+            holder = lock_file.read().decode("utf-8", errors="replace").strip()
+            detail = f"（{holder}）" if holder else ""
+            raise SafeDownloadError(
+                f"下载目录正被另一个进程使用: {local_dir}{detail}"
+            ) from exc
+
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()}\n".encode("ascii"))
+        lock_file.flush()
+        os.fsync(lock_file.fileno())
+        try:
+            yield lock_path
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+def _with_cross_process_download_lock(func):
+    @wraps(func)
+    def locked(repo_id: str, *, local_dir: str | Path, **kwargs):
+        with cross_process_download_lock(Path(local_dir)):
+            return func(repo_id, local_dir=local_dir, **kwargs)
+
+    return locked
+
 
 @dataclass(frozen=True)
 class RemoteFile:
@@ -335,7 +382,7 @@ def plan_parts(file_size: int, part_size: int) -> list[ByteRange]:
 def parse_content_range(header: str | None) -> tuple[int, int, int | None]:
     if not header:
         raise CorruptPartError("缺少 Content-Range 响应头")
-    match = CONTENT_RANGE_RE.search(header.strip())
+    match = CONTENT_RANGE_RE.fullmatch(header.strip())
     if not match:
         raise CorruptPartError(f"无法解析 Content-Range: {header!r}")
     start = int(match.group(1))
@@ -650,6 +697,7 @@ class StrictRangeSession:
         br: ByteRange,
         *,
         already: int,
+        expected_total_size: int,
         on_bytes: Callable[[int], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> int:
@@ -661,6 +709,17 @@ class StrictRangeSession:
             )
         if already == br.length:
             return 0
+        if expected_total_size < br.end + 1:
+            raise CorruptPartError(
+                f"远端文件大小非法: {expected_total_size} "
+                f"(range {br.start}-{br.end})"
+            )
+
+        current_size = dest.stat().st_size if dest.exists() else 0
+        if current_size != already:
+            raise CorruptPartError(
+                f"分块实际长度与 already 不一致: {current_size} != {already}"
+            )
 
         req_start = br.start + already
         req_end = br.end
@@ -682,81 +741,154 @@ class StrictRangeSession:
             )
             try:
                 _ensure_not_cancelled(cancel_event)
-                # We always send Range. HTTP 200 means the server ignored it —
-                # never write/truncate existing partial data.
-                if resp.status_code == 200:
-                    raise RangeRejectedError(
-                        f"服务器未接受 Range 请求（期望 206，收到 200）；"
-                        f"已保留现有 {format_bytes(already)} "
-                        f"（绝对文件偏移 {req_start}），不会截断，也不会把完整响应写入分块。"
-                    )
-                if resp.status_code != 206:
+                if resp.status_code not in (200, 206):
                     raise RangeRejectedError(
                         f"Range 响应状态异常: HTTP {resp.status_code} "
                         f"(请求 bytes={req_start}-{req_end})"
                     )
 
-                mode_note = "206"
-                cr_start, cr_end, _total = parse_content_range(
-                    resp.headers.get("Content-Range")
-                )
+                content_range = resp.headers.get("Content-Range")
+                if resp.status_code == 200 and not content_range:
+                    raise RangeRejectedError(
+                        f"服务器未接受可安全验证的 Range 请求"
+                        f"（HTTP 200 且缺少 Content-Range）；"
+                        f"已保留现有 {format_bytes(already)} "
+                        f"（绝对文件偏移 {req_start}），不会截断，"
+                        f"也不会把完整响应写入分块。"
+                    )
+
+                mode_note = str(resp.status_code)
+                cr_start, cr_end, cr_total = parse_content_range(content_range)
                 if cr_start != req_start or cr_end != req_end:
                     raise CorruptPartError(
                         f"Content-Range 与请求不一致: "
                         f"请求 {req_start}-{req_end}, 响应 {cr_start}-{cr_end}"
                     )
                 content_length = resp.headers.get("Content-Length")
-                if content_length is not None and int(content_length) != expected_len:
+                if resp.status_code == 200 and cr_total != expected_total_size:
+                    raise CorruptPartError(
+                        f"Content-Range total 与远端文件大小不一致: "
+                        f"{cr_total} != {expected_total_size}"
+                    )
+                if resp.status_code == 200 and content_length is None:
+                    raise CorruptPartError(
+                        "HTTP 200 兼容 Range 响应缺少 Content-Length"
+                    )
+                try:
+                    parsed_content_length = (
+                        int(content_length) if content_length is not None else None
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise CorruptPartError(
+                        f"无法解析 Content-Length: {content_length!r}"
+                    ) from exc
+                if (
+                    parsed_content_length is not None
+                    and parsed_content_length != expected_len
+                ):
                     raise CorruptPartError(
                         f"Content-Length 与期望分块长度不符: "
                         f"{content_length} != {expected_len}"
                     )
 
-                # Append-only open: never wb truncate.
-                with dest.open("ab") as fh:
-                    try:
-                        for chunk in resp.iter_content(chunk_size=self.chunk_size):
-                            _ensure_not_cancelled(cancel_event)
-                            if not chunk:
-                                continue
-                            remaining = expected_len - written
-                            if remaining <= 0:
-                                raise CorruptPartError(
-                                    f"响应体长于期望范围 ({expected_len} bytes); "
-                                    f"mode={mode_note}"
-                                )
-                            if len(chunk) > remaining:
-                                fh.write(chunk[:remaining])
-                                fh.flush()
-                                os.fsync(fh.fileno())
-                                written += remaining
-                                if on_bytes:
-                                    on_bytes(remaining)
-                                raise CorruptPartError(
-                                    f"响应体长于期望范围 ({expected_len} bytes); "
-                                    f"已拒绝超长部分"
-                                )
-                            fh.write(chunk)
-                            fh.flush()
-                            written += len(chunk)
-                            if on_bytes:
-                                on_bytes(len(chunk))
-                    except DownloadCancelled:
-                        raise
-                    except (
-                        requests.exceptions.ChunkedEncodingError,
-                        requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout,
-                    ) as exc:
-                        # Preserve any bytes already flushed; caller will retry remainder.
+                if resp.status_code == 200:
+                    # A non-standard 200 is accepted only after the complete body
+                    # has been staged and validated. No rejected 200 can mutate dest.
+                    with tempfile.TemporaryFile() as staged:
+                        try:
+                            for chunk in resp.iter_content(
+                                chunk_size=self.chunk_size
+                            ):
+                                _ensure_not_cancelled(cancel_event)
+                                if not chunk:
+                                    continue
+                                if written + len(chunk) > expected_len:
+                                    raise CorruptPartError(
+                                        f"响应体长于期望范围 "
+                                        f"({expected_len} bytes); mode={mode_note}"
+                                    )
+                                staged.write(chunk)
+                                written += len(chunk)
+                        except DownloadCancelled:
+                            raise
+                        except (
+                            requests.exceptions.ChunkedEncodingError,
+                            requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout,
+                        ) as exc:
+                            raise CorruptPartError(
+                                f"HTTP 200 兼容 Range 响应体偏短: "
+                                f"{written} != {expected_len}"
+                            ) from exc
+
+                        if written != expected_len:
+                            raise CorruptPartError(
+                                f"HTTP 200 兼容 Range 响应体长度不符: "
+                                f"{written} != {expected_len}"
+                            )
+
+                        _ensure_not_cancelled(cancel_event)
                         logger.warning(
-                            "传输中断，已安全落盘 %s/%s: %s",
-                            format_bytes(written),
-                            format_bytes(expected_len),
-                            exc,
+                            "ModelScope 返回非标准 HTTP 200，但 Content-Range "
+                            "完全匹配，按安全 Range 响应接受。"
                         )
-                    if written > 0:
-                        os.fsync(fh.fileno())
+                        staged.seek(0)
+                        with dest.open("ab") as fh:
+                            while True:
+                                chunk = staged.read(self.chunk_size)
+                                if not chunk:
+                                    break
+                                fh.write(chunk)
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                        if on_bytes:
+                            on_bytes(written)
+                else:
+                    # Append-only open: never wb truncate.
+                    with dest.open("ab") as fh:
+                        try:
+                            for chunk in resp.iter_content(chunk_size=self.chunk_size):
+                                _ensure_not_cancelled(cancel_event)
+                                if not chunk:
+                                    continue
+                                remaining = expected_len - written
+                                if remaining <= 0:
+                                    raise CorruptPartError(
+                                        f"响应体长于期望范围 ({expected_len} bytes); "
+                                        f"mode={mode_note}"
+                                    )
+                                if len(chunk) > remaining:
+                                    fh.write(chunk[:remaining])
+                                    fh.flush()
+                                    os.fsync(fh.fileno())
+                                    written += remaining
+                                    if on_bytes:
+                                        on_bytes(remaining)
+                                    raise CorruptPartError(
+                                        f"响应体长于期望范围 ({expected_len} bytes); "
+                                        f"已拒绝超长部分"
+                                    )
+                                fh.write(chunk)
+                                fh.flush()
+                                written += len(chunk)
+                                if on_bytes:
+                                    on_bytes(len(chunk))
+                        except DownloadCancelled:
+                            raise
+                        except (
+                            requests.exceptions.ChunkedEncodingError,
+                            requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout,
+                        ) as exc:
+                            # Preserve any bytes already flushed; caller will retry remainder.
+                            logger.warning(
+                                "传输中断，已安全落盘 %s/%s: %s",
+                                format_bytes(written),
+                                format_bytes(expected_len),
+                                exc,
+                            )
+                        if written > 0:
+                            os.fsync(fh.fileno())
             finally:
                 resp.close()
 
@@ -785,6 +917,7 @@ def download_part(
     rel_path: str,
     br: ByteRange,
     *,
+    expected_total_size: int,
     retries: int,
     progress: DurableProgress | None = None,
     cancel_event: threading.Event | None = None,
@@ -832,6 +965,7 @@ def download_part(
                 part_path,
                 br,
                 already=already,
+                expected_total_size=expected_total_size,
                 on_bytes=_on_bytes,
                 cancel_event=cancel_event,
             )
@@ -1085,6 +1219,7 @@ def download_one_file(
                     local_dir,
                     remote.path,
                     br,
+                    expected_total_size=remote.size,
                     retries=config.retries,
                     progress=progress,
                     cancel_event=cancel_event,
@@ -1216,6 +1351,7 @@ def advise_temp_cleanup(local_dir: Path) -> None:
         )
 
 
+@_with_cross_process_download_lock
 def snapshot_download_safe(
     repo_id: str,
     *,

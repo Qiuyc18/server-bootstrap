@@ -22,8 +22,10 @@ from modelscope_safe_download import (
     IntegrityError,
     RangeRejectedError,
     RemoteFile,
+    SafeDownloadError,
     StrictRangeSession,
     adopt_legacy_artifacts,
+    cross_process_download_lock,
     download_one_file,
     download_part,
     inventory_durable_bytes,
@@ -49,7 +51,7 @@ class RangeHTTPServer:
 
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
-        self.mode = "normal"  # normal | drop_after | ignore_range | bad_content_range | short_body | long_body | reject_start_slow_others
+        self.mode = "normal"
         self.drop_after = 0
         self.reject_start: int | None = None
         self.slow_seconds = 0.0
@@ -125,6 +127,31 @@ class RangeHTTPServer:
                     body = server.payload
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if mode.startswith("compatible_200"):
+                    body = server.payload[start : end + 1]
+                    cr_start = start
+                    cr_end = end
+                    cr_total = len(server.payload)
+                    if mode == "compatible_200_bad_range":
+                        cr_start += 1
+                        cr_end += 1
+                    elif mode == "compatible_200_bad_total":
+                        cr_total += 1
+
+                    self.send_response(200)
+                    content_range = f"bytes {cr_start}-{cr_end}/{cr_total}"
+                    if mode == "compatible_200_bad_header":
+                        content_range = "not-a-content-range"
+                    self.send_header("Content-Range", content_range)
+                    if mode != "compatible_200_missing_length":
+                        content_length = len(body)
+                        if mode == "compatible_200_bad_length":
+                            content_length += 1
+                        self.send_header("Content-Length", str(content_length))
                     self.end_headers()
                     self.wfile.write(body)
                     return
@@ -208,6 +235,15 @@ class PlanPartsTests(unittest.TestCase):
         with self.assertRaises(CorruptPartError):
             parse_content_range(None)
 
+    def test_cross_process_download_lock_rejects_second_holder(self):
+        root = Path(__file__).resolve().parent / "_tmp_safe_dl" / self._testMethodName
+        root.mkdir(parents=True, exist_ok=True)
+        with cross_process_download_lock(root):
+            with self.assertRaises(SafeDownloadError) as ctx:
+                with cross_process_download_lock(root):
+                    pass
+        self.assertIn("另一个进程", str(ctx.exception))
+
 
 class SafeDownloadHTTPTests(unittest.TestCase):
     def setUp(self):
@@ -285,6 +321,7 @@ class SafeDownloadHTTPTests(unittest.TestCase):
                 self.root,
                 rel,
                 br,
+                expected_total_size=len(self.payload),
                 retries=1,
             )
         self.assertTrue(part_path.exists())
@@ -300,6 +337,7 @@ class SafeDownloadHTTPTests(unittest.TestCase):
             self.root,
             rel,
             br,
+            expected_total_size=len(self.payload),
             retries=3,
         )
         self.assertTrue(ok_path.exists())
@@ -334,6 +372,7 @@ class SafeDownloadHTTPTests(unittest.TestCase):
                 self.root,
                 rel,
                 br,
+                expected_total_size=len(self.payload),
                 retries=1,
             )
         self.assertIn("不会截断", str(ctx.exception))
@@ -343,6 +382,118 @@ class SafeDownloadHTTPTests(unittest.TestCase):
         self.assertEqual(part_path.read_bytes(), before)
         # Must not have grown by a full payload append either.
         self.assertNotEqual(part_path.stat().st_size, size_before + len(self.payload))
+
+    def test_compatible_200_exact_range_resumes_safely(self):
+        rel = "compatible.bin"
+        br = ByteRange(0, 7_999)
+        ok_path, part_path = part_paths(self.root, rel, br)
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = self.payload[:3_000]
+        part_path.write_bytes(existing)
+
+        self.server.mode = "compatible_200"
+        with self.assertLogs("modelscope_safe_download", level="WARNING") as logs:
+            wrote = download_part(
+                self.session,
+                self.server.url,
+                self.root,
+                rel,
+                br,
+                expected_total_size=len(self.payload),
+                retries=1,
+            )
+
+        self.assertEqual(wrote, br.length - len(existing))
+        self.assertFalse(part_path.exists())
+        self.assertEqual(ok_path.read_bytes(), self.payload[: br.length])
+        self.assertTrue(
+            any(
+                "ModelScope 返回非标准 HTTP 200，但 Content-Range 完全匹配，"
+                "按安全 Range 响应接受。" in line
+                for line in logs.output
+            )
+        )
+
+    def _assert_compatible_200_rejected_without_modifying_part(
+        self, mode: str
+    ) -> None:
+        rel = f"{mode}.bin"
+        br = ByteRange(0, 7_999)
+        _, part_path = part_paths(self.root, rel, br)
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = self.payload[:3_000]
+        part_path.write_bytes(existing)
+        inode = part_path.stat().st_ino
+
+        self.server.mode = mode
+        response_patch = None
+        if mode in (
+            "compatible_200_short_body",
+            "compatible_200_long_body",
+        ):
+            expected_body = self.payload[len(existing) : br.end + 1]
+            actual_body = (
+                expected_body[:-1]
+                if mode == "compatible_200_short_body"
+                else expected_body + b"EXTRA"
+            )
+            response = mock.Mock()
+            response.status_code = 200
+            response.headers = {
+                "Content-Range": (
+                    f"bytes {len(existing)}-{br.end}/{len(self.payload)}"
+                ),
+                "Content-Length": str(len(expected_body)),
+            }
+            response.iter_content.side_effect = lambda chunk_size: [actual_body]
+            response_patch = mock.patch.object(
+                self.session._session, "get", return_value=response
+            )
+
+        context = response_patch or mock.patch.object(
+            self.session._session,
+            "get",
+            wraps=self.session._session.get,
+        )
+        with context:
+            with self.assertRaises(CorruptPartError):
+                self.session.fetch_range_to_file(
+                    self.server.url,
+                    part_path,
+                    br,
+                    already=len(existing),
+                    expected_total_size=len(self.payload),
+                )
+
+        self.assertEqual(part_path.stat().st_ino, inode)
+        self.assertEqual(part_path.read_bytes(), existing)
+
+    def test_compatible_200_shifted_content_range_rejected(self):
+        self._assert_compatible_200_rejected_without_modifying_part(
+            "compatible_200_bad_range"
+        )
+
+    def test_compatible_200_wrong_total_rejected(self):
+        self._assert_compatible_200_rejected_without_modifying_part(
+            "compatible_200_bad_total"
+        )
+
+    def test_compatible_200_malformed_headers_rejected(self):
+        for mode in (
+            "compatible_200_bad_header",
+            "compatible_200_missing_length",
+            "compatible_200_bad_length",
+        ):
+            with self.subTest(mode=mode):
+                self._assert_compatible_200_rejected_without_modifying_part(mode)
+
+    def test_compatible_200_wrong_body_lengths_rejected(self):
+        for mode in (
+            "compatible_200_short_body",
+            "compatible_200_long_body",
+        ):
+            with self.subTest(mode=mode):
+                self._assert_compatible_200_rejected_without_modifying_part(mode)
 
     def test_bad_content_range_rejected(self):
         rel = "badcr.bin"
@@ -355,6 +506,7 @@ class SafeDownloadHTTPTests(unittest.TestCase):
                 self.root,
                 rel,
                 br,
+                expected_total_size=len(self.payload),
                 retries=1,
             )
 
@@ -370,6 +522,7 @@ class SafeDownloadHTTPTests(unittest.TestCase):
                 self.root,
                 rel,
                 br,
+                expected_total_size=len(self.payload),
                 retries=1,
             )
         self.assertTrue(part_path.exists())
@@ -384,6 +537,7 @@ class SafeDownloadHTTPTests(unittest.TestCase):
             self.root,
             rel,
             br,
+            expected_total_size=len(self.payload),
             retries=3,
         )
         ok_path, _ = part_paths(self.root, rel, br)
@@ -400,6 +554,7 @@ class SafeDownloadHTTPTests(unittest.TestCase):
                 self.root,
                 rel,
                 br,
+                expected_total_size=len(self.payload),
                 retries=1,
             )
 

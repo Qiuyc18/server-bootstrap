@@ -9,7 +9,7 @@
 | `init.sh` | 通用 Debian/Ubuntu：基础包、[ble.sh](https://github.com/akinomyoga/ble.sh)、[Oh My Bash](https://github.com/ohmybash/oh-my-bash)、`~/.ssh/id_ed25519`（若不存在）、[uv](https://docs.astral.sh/uv/) |
 | `init_on_amd.sh` | 在通用步骤基础上安装 Docker、OpenMPI，并写入 **vLLM ROCm 7 Docker** 相关配置（默认镜像 [`rocm/vllm-dev`](https://hub.docker.com/r/rocm/vllm-dev/tags)）。适用于宿主机仍为 ROCm 6.x（如 mi250-002）而 wheel 需 ROCm 7 的场景，避免裸机升级 ROCm；不生成 SSH 密钥 |
 | `download.py` | Hugging Face / ModelScope 的 `search` / `download`；ModelScope 大文件走安全续传（`modelscope_safe_download.py`） |
-| `modelscope_safe_download.py` | ModelScope 安全分块下载：严格校验 HTTP 206 / Content-Range，避免截断 `.incomplete` |
+| `modelscope_safe_download.py` | ModelScope 安全分块下载：严格校验 Range 状态、响应头与响应体，避免截断 `.incomplete` |
 
 ## 系统要求
 
@@ -85,7 +85,9 @@ uv run python download.py download Qwen/Qwen2.5-1.5B-Instruct --local-dir ./mode
 - **文件内分块并发**（`--part-workers`，默认 4）：单个大文件同时拉多少个 Range 分块
 - **分块大小**（`--part-size-mb`，默认 160）：建议 128～256 MiB
 - 总 HTTP 连接上限约为 `max-workers × part-workers`（默认 1×4=4）
-- 所有非零偏移 Range 必须是 **HTTP 206**，且 **Content-Range / 长度严格匹配**；若返回 200：**绝不截断、绝不乱追加**，保留已有字节并失败退出
+- HTTP 206 会严格校验 **Content-Range / Content-Length / 实际响应体长度**
+- 仅当 HTTP 200 的 **Content-Range 起止位置与请求完全一致、total 等于远端 Size，且 Content-Length 与实际响应体长度均精确匹配**时，才作为 ModelScope 非标准 Range 响应接受；否则保留旧分块并拒绝
+- 同一下载目录使用跨进程锁，避免多个下载进程同时修改分块；Range 致命错误仍会 fail-fast 取消未开始任务
 
 推荐命令：
 
