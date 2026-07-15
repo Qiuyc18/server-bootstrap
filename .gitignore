@@ -77,6 +77,11 @@ tensorboard/
 # Wandb
 wandb/
 
+### 测试临时产物 ###
+tests/_tmp_safe_dl/
+tests/**/__pycache__/
+tests/**/*.pyc
+
 
 ### 版本控制自身保护 ###
 !.gitkeep

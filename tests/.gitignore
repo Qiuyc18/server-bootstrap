@@ -1,2 +1,4 @@
-# test temp outputs
-tests/_tmp_safe_dl/
+# test temp outputs (paths relative to this directory)
+_tmp_safe_dl/
+__pycache__/
+*.py[cod]

@@ -220,15 +220,11 @@ def _hub_api_list_and_urls(
     """
     from modelscope_hub import HubApi
 
-    try:
-        from modelscope_hub.constants import MODELSCOPE_URL_ENDPOINT as default_endpoint
-    except Exception:  # pragma: no cover
-        default_endpoint = "https://www.modelscope.cn"
-
+    # Let HubApi resolve endpoint itself:
+    # explicit arg → MODELSCOPE_ENDPOINT env → SDK DEFAULT_ENDPOINT.
     api_kwargs = {"token": token}
-    resolved_endpoint = endpoint or default_endpoint
-    if resolved_endpoint:
-        api_kwargs["endpoint"] = resolved_endpoint
+    if endpoint:
+        api_kwargs["endpoint"] = endpoint
     api = HubApi(**api_kwargs)
 
     legacy = getattr(api, "legacy", None)
