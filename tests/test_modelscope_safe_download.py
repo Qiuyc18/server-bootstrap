@@ -7,14 +7,18 @@ import hashlib
 import os
 import socket
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 from modelscope_safe_download import (
     ByteRange,
     CorruptPartError,
     DownloadConfig,
+    DownloadCancelled,
+    DurableProgress,
     IntegrityError,
     RangeRejectedError,
     RemoteFile,
@@ -30,6 +34,7 @@ from modelscope_safe_download import (
     part_paths,
     plan_parts,
     sha256_file,
+    snapshot_download_safe,
 )
 
 
@@ -44,10 +49,13 @@ class RangeHTTPServer:
 
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
-        self.mode = "normal"  # normal | drop_after | ignore_range | bad_content_range | short_body | long_body
+        self.mode = "normal"  # normal | drop_after | ignore_range | bad_content_range | short_body | long_body | reject_start_slow_others
         self.drop_after = 0
+        self.reject_start: int | None = None
+        self.slow_seconds = 0.0
         self.served_ranges: list[tuple[int, int | None]] = []
         self.hits = 0
+        self.paths_hit: list[str] = []
         self._lock = threading.Lock()
         handler = self._build_handler()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", _free_port()), handler)
@@ -76,6 +84,7 @@ class RangeHTTPServer:
             def do_GET(self):  # noqa: N802
                 with server._lock:
                     server.hits += 1
+                    server.paths_hit.append(self.path)
                 range_header = self.headers.get("Range")
                 start = 0
                 end = len(server.payload) - 1
@@ -91,6 +100,27 @@ class RangeHTTPServer:
                         server.served_ranges.append((0, None))
 
                 mode = server.mode
+                if mode == "reject_start_slow_others":
+                    if server.reject_start is not None and start == server.reject_start:
+                        body = server.payload
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    if server.slow_seconds > 0:
+                        time.sleep(server.slow_seconds)
+                    body = server.payload[start : end + 1]
+                    self.send_response(206)
+                    self.send_header(
+                        "Content-Range",
+                        f"bytes {start}-{end}/{len(server.payload)}",
+                    )
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
                 if mode == "ignore_range":
                     body = server.payload
                     self.send_response(200)
@@ -465,6 +495,164 @@ class SafeDownloadHTTPTests(unittest.TestCase):
         self.assertTrue(any(".incomplete" in t for t in tips))
         ok0, _ = part_paths(self.root, rel, parts[0])
         self.assertTrue(ok0.exists())
+
+
+class FailFastCancelTests(unittest.TestCase):
+    def setUp(self):
+        # Large enough for many queued parts with 4 workers.
+        self.payload = os.urandom(40_000)
+        self.sha = hashlib.sha256(self.payload).hexdigest()
+        self.server = RangeHTTPServer(self.payload)
+        self.server.start()
+        self.root = (
+            Path(__file__).resolve().parent / "_tmp_safe_dl" / self._testMethodName
+        )
+        if self.root.exists():
+            for p in sorted(self.root.rglob("*"), reverse=True):
+                if p.is_file():
+                    p.unlink()
+                else:
+                    p.rmdir()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.session = StrictRangeSession(
+            timeout=5,
+            chunk_size=1024,
+            cookies=None,
+            headers={"User-Agent": "test"},
+            connection_semaphore=threading.Semaphore(8),
+        )
+
+    def tearDown(self):
+        self.session.close()
+        self.server.stop()
+
+    def test_range_200_retries_then_fail_fast_cancels_pending(self):
+        rel = "big.bin"
+        part_size = 1_000
+        parts = plan_parts(len(self.payload), part_size)
+        self.assertGreaterEqual(len(parts), 20)
+
+        # Preserve an already-written in-progress part for a later range.
+        preserve_br = parts[10]
+        _, preserve_part = part_paths(self.root, rel, preserve_br)
+        preserve_part.parent.mkdir(parents=True, exist_ok=True)
+        existing = self.payload[preserve_br.start : preserve_br.start + 400]
+        preserve_part.write_bytes(existing)
+        inode = preserve_part.stat().st_ino
+        size_before = preserve_part.stat().st_size
+
+        reject_br = parts[2]
+        self.server.mode = "reject_start_slow_others"
+        self.server.reject_start = reject_br.start
+        self.server.slow_seconds = 0.35
+
+        retries = 3
+        cancel_event = threading.Event()
+        progress = DurableProgress(len(self.payload), desc="failfast")
+        cfg = DownloadConfig(
+            file_workers=1,
+            part_workers=4,
+            part_size=part_size,
+            retries=retries,
+            timeout=5,
+            chunk_size=1024,
+        )
+
+        with mock.patch(
+            "modelscope_safe_download._sleep_backoff",
+            lambda *a, **k: None,
+        ):
+            with self.assertRaises(RangeRejectedError):
+                download_one_file(
+                    remote=RemoteFile(rel, size=len(self.payload), sha256=self.sha),
+                    url=self.server.url,
+                    local_dir=self.root,
+                    config=cfg,
+                    session=self.session,
+                    progress=progress,
+                    cancel_event=cancel_event,
+                )
+        progress.close()
+
+        self.assertTrue(cancel_event.is_set())
+
+        # Existing partial must be untouched (no truncate / append of 200 body).
+        self.assertTrue(preserve_part.exists())
+        self.assertEqual(preserve_part.stat().st_ino, inode)
+        self.assertEqual(preserve_part.stat().st_size, size_before)
+        self.assertEqual(preserve_part.read_bytes(), existing)
+
+        # Rejected Range is retried a limited number of times, not flooded.
+        reject_hits = [
+            (s, e)
+            for s, e in self.server.served_ranges
+            if s == reject_br.start and e == reject_br.end
+        ]
+        self.assertGreaterEqual(len(reject_hits), 1)
+        self.assertLessEqual(len(reject_hits), retries)
+
+        # Far later parts should mostly never start (queued futures cancelled).
+        late_starts = {p.start for p in parts[15:]}
+        started_late = {s for s, _ in self.server.served_ranges if s in late_starts}
+        self.assertLessEqual(len(started_late), 2)
+
+        # Total HTTP hits must stay far below "start every remaining part".
+        self.assertLess(self.server.hits, len(parts) + retries + 8)
+
+    def test_fail_fast_does_not_continue_next_file(self):
+        part_size = 2_000
+        file_a = RemoteFile("a.bin", size=len(self.payload), sha256=self.sha)
+        file_b = RemoteFile(
+            "b.bin",
+            size=len(self.payload),
+            sha256=self.sha,
+        )
+        parts = plan_parts(len(self.payload), part_size)
+        reject_br = parts[1]
+
+        self.server.mode = "reject_start_slow_others"
+        self.server.reject_start = reject_br.start
+        self.server.slow_seconds = 0.2
+
+        cfg = DownloadConfig(
+            file_workers=1,
+            part_workers=4,
+            part_size=part_size,
+            retries=2,
+            timeout=5,
+            chunk_size=1024,
+        )
+
+        def fake_list(*_args, **_kwargs):
+            def url_for(path: str) -> str:
+                # Distinct paths so we can observe which file was contacted.
+                return self.server.url + f"?path={path}"
+
+            return [file_a, file_b], url_for, None
+
+        with mock.patch(
+            "modelscope_safe_download.require_supported_modelscope_versions",
+            return_value=("1.38.1", "0.1.7"),
+        ), mock.patch(
+            "modelscope_safe_download._hub_api_list_and_urls",
+            side_effect=fake_list,
+        ), mock.patch(
+            "modelscope_safe_download._sleep_backoff",
+            lambda *a, **k: None,
+        ):
+            with self.assertRaises(Exception):
+                snapshot_download_safe(
+                    "org/demo",
+                    local_dir=self.root,
+                    repo_type="model",
+                    config=cfg,
+                )
+
+        # b.bin must not have been requested after fail-fast.
+        b_hits = [p for p in self.server.paths_hit if "path=b.bin" in p]
+        self.assertEqual(b_hits, [])
+        a_hits = [p for p in self.server.paths_hit if "path=a.bin" in p]
+        self.assertGreater(len(a_hits), 0)
 
 
 class CLIHelpTests(unittest.TestCase):

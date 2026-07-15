@@ -17,11 +17,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import re
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -65,6 +66,50 @@ class CorruptPartError(SafeDownloadError):
 class IntegrityError(SafeDownloadError):
     """Final size or SHA256 verification failed."""
 
+
+class DownloadCancelled(SafeDownloadError):
+    """Download cancelled via shared cancel_event (fail-fast)."""
+
+
+def _signal_cancel(cancel_event: threading.Event, message: str) -> None:
+    """Set cancel_event once and log the fail-fast stop message."""
+    if cancel_event.is_set():
+        return
+    cancel_event.set()
+    logger.error("%s", message)
+
+
+def _ensure_not_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled("下载已取消（fail-fast）")
+
+
+def _sleep_backoff(attempt: int, cancel_event: threading.Event | None) -> None:
+    """Exponential backoff with jitter; abort early if cancelled."""
+    base = min(2 ** max(attempt - 1, 0), 30)
+    delay = base + random.uniform(0, 0.5 * base)
+    deadline = time.monotonic() + delay
+    while True:
+        _ensure_not_cancelled(cancel_event)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if cancel_event is None:
+            time.sleep(remaining)
+            return
+        cancel_event.wait(timeout=min(0.2, remaining))
+
+
+def _shutdown_cancel_futures(
+    pool: ThreadPoolExecutor,
+    futures: dict[Future, object],
+    cancel_event: threading.Event,
+    message: str,
+) -> None:
+    _signal_cancel(cancel_event, message)
+    for fut in futures:
+        fut.cancel()
+    pool.shutdown(wait=True, cancel_futures=True)
 
 @dataclass(frozen=True)
 class RemoteFile:
@@ -606,8 +651,10 @@ class StrictRangeSession:
         *,
         already: int,
         on_bytes: Callable[[int], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Append validated range bytes into dest. Returns newly written bytes."""
+        _ensure_not_cancelled(cancel_event)
         if already < 0 or already > br.length:
             raise CorruptPartError(
                 f"分块已有长度非法: {already} (range {br.start}-{br.end})"
@@ -625,6 +672,7 @@ class StrictRangeSession:
         written = 0
 
         with self.connection_semaphore:
+            _ensure_not_cancelled(cancel_event)
             resp = self._session.get(
                 url,
                 headers=headers,
@@ -633,45 +681,42 @@ class StrictRangeSession:
                 timeout=self.timeout,
             )
             try:
-                if resp.status_code == 200 and req_start > 0:
-                    # Critical: do NOT open dest with wb; do NOT append full body.
+                _ensure_not_cancelled(cancel_event)
+                # We always send Range. HTTP 200 means the server ignored it —
+                # never write/truncate existing partial data.
+                if resp.status_code == 200:
                     raise RangeRejectedError(
                         f"服务器未接受 Range 请求（期望 206，收到 200）；"
                         f"已保留现有 {format_bytes(already)} "
                         f"（绝对文件偏移 {req_start}），不会截断，也不会把完整响应写入分块。"
                     )
-                if resp.status_code == 200 and req_start == 0 and already == 0:
-                    # Full-file response for a part that starts at 0: still require
-                    # exact part length; never write more than this part needs.
-                    content_length = resp.headers.get("Content-Length")
-                    # Stream only expected_len bytes; if server sends more, reject.
-                    mode_note = "full-200-as-first-part"
-                elif resp.status_code != 206:
+                if resp.status_code != 206:
                     raise RangeRejectedError(
                         f"Range 响应状态异常: HTTP {resp.status_code} "
                         f"(请求 bytes={req_start}-{req_end})"
                     )
-                else:
-                    mode_note = "206"
-                    cr_start, cr_end, _total = parse_content_range(
-                        resp.headers.get("Content-Range")
+
+                mode_note = "206"
+                cr_start, cr_end, _total = parse_content_range(
+                    resp.headers.get("Content-Range")
+                )
+                if cr_start != req_start or cr_end != req_end:
+                    raise CorruptPartError(
+                        f"Content-Range 与请求不一致: "
+                        f"请求 {req_start}-{req_end}, 响应 {cr_start}-{cr_end}"
                     )
-                    if cr_start != req_start or cr_end != req_end:
-                        raise CorruptPartError(
-                            f"Content-Range 与请求不一致: "
-                            f"请求 {req_start}-{req_end}, 响应 {cr_start}-{cr_end}"
-                        )
-                    content_length = resp.headers.get("Content-Length")
-                    if content_length is not None and int(content_length) != expected_len:
-                        raise CorruptPartError(
-                            f"Content-Length 与期望分块长度不符: "
-                            f"{content_length} != {expected_len}"
-                        )
+                content_length = resp.headers.get("Content-Length")
+                if content_length is not None and int(content_length) != expected_len:
+                    raise CorruptPartError(
+                        f"Content-Length 与期望分块长度不符: "
+                        f"{content_length} != {expected_len}"
+                    )
 
                 # Append-only open: never wb truncate.
                 with dest.open("ab") as fh:
                     try:
                         for chunk in resp.iter_content(chunk_size=self.chunk_size):
+                            _ensure_not_cancelled(cancel_event)
                             if not chunk:
                                 continue
                             remaining = expected_len - written
@@ -696,6 +741,8 @@ class StrictRangeSession:
                             written += len(chunk)
                             if on_bytes:
                                 on_bytes(len(chunk))
+                    except DownloadCancelled:
+                        raise
                     except (
                         requests.exceptions.ChunkedEncodingError,
                         requests.exceptions.ConnectionError,
@@ -740,15 +787,21 @@ def download_part(
     *,
     retries: int,
     progress: DurableProgress | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> int:
     """Download one part with retries. Returns newly downloaded bytes."""
+    cancel_event = cancel_event or threading.Event()
+    _ensure_not_cancelled(cancel_event)
+
     ok_path, part_path = part_paths(local_dir, rel_path, br)
     if ok_path.exists() and ok_path.stat().st_size == br.length:
         return 0
 
     downloaded = 0
     last_error: Exception | None = None
+    range_reject_streak = 0
     for attempt in range(1, retries + 1):
+        _ensure_not_cancelled(cancel_event)
         already = part_path.stat().st_size if part_path.exists() else 0
         if already > br.length:
             quarantine = part_path.with_suffix(".part.invalid")
@@ -780,8 +833,10 @@ def download_part(
                 br,
                 already=already,
                 on_bytes=_on_bytes,
+                cancel_event=cancel_event,
             )
             downloaded += wrote
+            range_reject_streak = 0
             final = part_path.stat().st_size if part_path.exists() else 0
             if final == br.length:
                 os.replace(part_path, ok_path)
@@ -797,8 +852,28 @@ def download_part(
                 final,
                 br.length,
             )
-        except RangeRejectedError:
+            if attempt < retries:
+                _sleep_backoff(attempt, cancel_event)
+        except DownloadCancelled:
             raise
+        except RangeRejectedError as exc:
+            # Do not write the 200 body (already ensured by fetch). Retry same Range.
+            range_reject_streak += 1
+            last_error = exc
+            logger.warning(
+                "Range 被拒绝 %s bytes=%s-%s attempt %s/%s（连续 %s 次）: %s；"
+                "已保留现有分块，不会截断；有限重试中",
+                rel_path,
+                br.start,
+                br.end,
+                attempt,
+                retries,
+                range_reject_streak,
+                exc,
+            )
+            if attempt >= retries:
+                break
+            _sleep_backoff(attempt, cancel_event)
         except CorruptPartError as exc:
             # Validation errors (bad Content-Range / overlong body) are not cured by retry.
             if "Content-Range" in str(exc) or "长于期望范围" in str(exc):
@@ -813,7 +888,8 @@ def download_part(
                 retries,
                 exc,
             )
-            time.sleep(min(2 ** (attempt - 1), 30))
+            if attempt < retries:
+                _sleep_backoff(attempt, cancel_event)
         except (requests.RequestException, SafeDownloadError) as exc:
             last_error = exc
             logger.warning(
@@ -825,8 +901,14 @@ def download_part(
                 retries,
                 exc,
             )
-            time.sleep(min(2 ** (attempt - 1), 30))
+            if attempt < retries:
+                _sleep_backoff(attempt, cancel_event)
 
+    if isinstance(last_error, RangeRejectedError):
+        raise RangeRejectedError(
+            f"分块 Range 连续被拒绝达上限 ({retries}): {rel_path} "
+            f"bytes={br.start}-{br.end}: {last_error}"
+        ) from last_error
     raise SafeDownloadError(
         f"分块下载失败 {rel_path} bytes={br.start}-{br.end}: {last_error}"
     )
@@ -906,7 +988,11 @@ def download_one_file(
     config: DownloadConfig,
     session: StrictRangeSession,
     progress: DurableProgress,
+    cancel_event: threading.Event | None = None,
 ) -> FileDownloadStats:
+    cancel_event = cancel_event or threading.Event()
+    _ensure_not_cancelled(cancel_event)
+
     target = local_dir / remote.path
     if remote.size is None:
         raise SafeDownloadError(
@@ -960,8 +1046,6 @@ def download_one_file(
     # Refresh durable progress from disk before network.
     durable = inventory_durable_bytes(local_dir, remote.path, parts)
     stats.reused_bytes = durable
-    # progress already may include other files; add only this file's durable delta
-    # caller initializes progress at 0 and we add durable here once.
     progress.add(durable)
 
     pending = []
@@ -982,12 +1066,19 @@ def download_one_file(
 
     downloaded = 0
     if pending:
-        with ThreadPoolExecutor(
-            max_workers=max(1, min(config.part_workers, len(pending))),
+        workers = max(1, min(config.part_workers, len(pending)))
+        pool = ThreadPoolExecutor(
+            max_workers=workers,
             thread_name_prefix="ms-part",
-        ) as pool:
-            futures = {
-                pool.submit(
+        )
+        futures: dict[Future, ByteRange] = {}
+        fatal: Exception | None = None
+        shut_down = False
+        try:
+            for br in pending:
+                if cancel_event.is_set():
+                    break
+                fut = pool.submit(
                     download_part,
                     session,
                     url,
@@ -996,34 +1087,72 @@ def download_one_file(
                     br,
                     retries=config.retries,
                     progress=progress,
-                ): br
-                for br in pending
-            }
-            for fut in as_completed(futures):
+                    cancel_event=cancel_event,
+                )
+                futures[fut] = br
+
+            for fut in as_completed(list(futures.keys())):
                 br = futures[fut]
+                if fut.cancelled():
+                    continue
                 try:
                     downloaded += fut.result()
+                except DownloadCancelled as exc:
+                    fatal = exc
+                    break
                 except RangeRejectedError as exc:
                     already = inventory_durable_bytes(
                         local_dir, remote.path, parts
                     )
-                    logger.error(
-                        "服务器未接受 Range 请求；已保留现有 %s，不会截断，停止安全下载。"
-                        " 如需从头下载，请显式使用 --force-restart-file 并先清理无效临时文件。"
-                        " 文件=%s 范围=%s-%s 原因=%s",
-                        format_bytes(already),
-                        remote.path,
-                        br.start,
-                        br.end,
-                        exc,
+                    fatal = exc
+                    _shutdown_cancel_futures(
+                        pool,
+                        futures,
+                        cancel_event,
+                        (
+                            "停止安全下载：Range 连续失败达上限；"
+                            f"已保留现有 {format_bytes(already)}，不会截断。"
+                            f" 文件={remote.path} 范围={br.start}-{br.end} 原因={exc}"
+                        ),
                     )
-                    raise
-                except Exception:
-                    logger.exception(
-                        "分块失败: %s bytes=%s-%s", remote.path, br.start, br.end
+                    shut_down = True
+                    break
+                except Exception as exc:
+                    fatal = exc
+                    _shutdown_cancel_futures(
+                        pool,
+                        futures,
+                        cancel_event,
+                        (
+                            "停止安全下载：文件分块致命错误；已取消未开始任务。"
+                            f" 文件={remote.path} 范围={br.start}-{br.end} 原因={exc}"
+                        ),
                     )
-                    raise
+                    shut_down = True
+                    break
+        finally:
+            if not shut_down:
+                if cancel_event.is_set():
+                    for fut in futures:
+                        fut.cancel()
+                    pool.shutdown(wait=True, cancel_futures=True)
+                else:
+                    pool.shutdown(wait=True, cancel_futures=False)
 
+        if fatal is not None:
+            if not cancel_event.is_set():
+                already = inventory_durable_bytes(local_dir, remote.path, parts)
+                _signal_cancel(
+                    cancel_event,
+                    (
+                        "停止安全下载：已取消该文件剩余分块；"
+                        f"已保留现有 {format_bytes(already)}。"
+                        f" 文件={remote.path} 原因={fatal}"
+                    ),
+                )
+            raise fatal
+
+    _ensure_not_cancelled(cancel_event)
     stats.downloaded_bytes = downloaded
     merge_parts(
         local_dir,
@@ -1101,8 +1230,8 @@ def snapshot_download_safe(
     cfg = config or DownloadConfig()
     if cfg.file_workers < 1 or cfg.part_workers < 1:
         raise ValueError("file_workers / part_workers must be >= 1")
-    if cfg.part_size < 1024 * 1024:
-        raise ValueError("part_size must be >= 1MiB")
+    if cfg.part_size < 1024:
+        raise ValueError("part_size must be >= 1KiB")
 
     ms_ver, hub_ver = require_supported_modelscope_versions()
     revision = revision or "master"
@@ -1160,14 +1289,21 @@ def snapshot_download_safe(
     )
 
     stats: list[FileDownloadStats] = []
-    errors: list[str] = []
+    cancel_event = threading.Event()
+    fatal: Exception | None = None
     try:
-        with ThreadPoolExecutor(
-            max_workers=max(1, min(cfg.file_workers, len(files))),
+        workers = max(1, min(cfg.file_workers, len(files)))
+        pool = ThreadPoolExecutor(
+            max_workers=workers,
             thread_name_prefix="ms-file",
-        ) as pool:
-            futures = {
-                pool.submit(
+        )
+        futures: dict[Future, RemoteFile] = {}
+        shut_down = False
+        try:
+            for remote in files:
+                if cancel_event.is_set():
+                    break
+                fut = pool.submit(
                     download_one_file,
                     remote=remote,
                     url=url_for(remote.path),
@@ -1175,25 +1311,47 @@ def snapshot_download_safe(
                     config=cfg,
                     session=session,
                     progress=progress,
-                ): remote
-                for remote in files
-            }
-            for fut in as_completed(futures):
+                    cancel_event=cancel_event,
+                )
+                futures[fut] = remote
+
+            for fut in as_completed(list(futures.keys())):
                 remote = futures[fut]
+                if fut.cancelled():
+                    continue
                 try:
                     stats.append(fut.result())
                 except Exception as exc:
-                    errors.append(f"{remote.path}: {exc}")
-                    logger.error("文件下载失败 %s: %s", remote.path, exc)
+                    fatal = exc
+                    _shutdown_cancel_futures(
+                        pool,
+                        futures,
+                        cancel_event,
+                        (
+                            "停止安全下载：仓库文件级致命错误；"
+                            "已取消未开始的文件任务，等待进行中的请求安全退出。"
+                            f" 文件={remote.path} 原因={exc}"
+                        ),
+                    )
+                    shut_down = True
+                    break
+        finally:
+            if not shut_down:
+                if cancel_event.is_set():
+                    for fut in futures:
+                        fut.cancel()
+                    pool.shutdown(wait=True, cancel_futures=True)
+                else:
+                    pool.shutdown(wait=True, cancel_futures=False)
     finally:
         session.close()
         progress.close()
 
-    if errors:
+    if fatal is not None:
         advise_temp_cleanup(local_path)
         raise SafeDownloadError(
-            "部分文件下载失败:\n  - " + "\n  - ".join(errors)
-        )
+            f"下载失败（已 fail-fast 取消剩余任务）: {fatal}"
+        ) from fatal
 
     reused = sum(s.reused_bytes for s in stats)
     downloaded = sum(s.downloaded_bytes for s in stats)
