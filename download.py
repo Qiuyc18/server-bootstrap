@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import logging
 import os
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -114,6 +117,123 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_bytes(num_bytes: float) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.2f}{unit}"
+        size /= 1024
+    return f"{num_bytes:.0f}B"
+
+
+def _format_speed(bytes_per_sec: float | None) -> str:
+    if bytes_per_sec is None or bytes_per_sec <= 0:
+        return "?B/s"
+    return f"{_format_bytes(bytes_per_sec)}/s"
+
+
+def _build_download_tqdm_class(stats: dict):
+    from huggingface_hub.utils import tqdm as hf_tqdm
+
+    class DownloadProgressTqdm(hf_tqdm):
+        """显式展示瞬时/平均速度，并定时刷新进度条。
+
+        HF HTTP 下载默认约每 10MB 才回调一次进度，慢速网络上默认条会长时间不动，
+        速率也容易显示为 `?B/s`。这里用后台刷新 + 自算速率让速度持续可见。
+        """
+
+        def __init__(self, *args, **kwargs):
+            # disable=True 时 tqdm 不保留 unit，从入参判断是否为字节进度条。
+            is_bytes_bar = kwargs.get("unit") == "B" or bool(
+                kwargs.get("unit_scale")
+            )
+            # `_create_progress_bar` 在非 TTY（管道/日志采集）下会把 disable 关掉，
+            # 只剩 thread_map 的文件计数条，因而看不到下载速度。字节条强制开启。
+            if is_bytes_bar:
+                kwargs["disable"] = False
+            kwargs.setdefault("miniters", 1)
+            kwargs.setdefault("mininterval", 0.5)
+            kwargs.setdefault("smoothing", 0.08)
+            if is_bytes_bar:
+                kwargs.setdefault(
+                    "bar_format",
+                    "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                    "[{elapsed}<{remaining}] {postfix}",
+                )
+            else:
+                kwargs.setdefault(
+                    "bar_format",
+                    "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                    "[{elapsed}<{remaining}, {rate_fmt}]",
+                )
+            super().__init__(*args, **kwargs)
+            self._is_bytes_bar = is_bytes_bar
+            self._started_at = time.monotonic()
+            self._last_n = float(self.n or 0)
+            self._last_t = self._started_at
+            self._instant_speed: float | None = None
+            self._refresh_stop = threading.Event()
+            self._refresh_thread: threading.Thread | None = None
+            if not self.disable and self._is_bytes_bar:
+                self._refresh_thread = threading.Thread(
+                    target=self._auto_refresh, daemon=True
+                )
+                self._refresh_thread.start()
+
+        def _auto_refresh(self) -> None:
+            while not self._refresh_stop.wait(1.0):
+                self._update_speed_postfix()
+                self.refresh()
+
+        def _track_bytes(self) -> None:
+            if self._is_bytes_bar:
+                stats["bytes"] = max(float(stats.get("bytes", 0)), float(self.n or 0))
+
+        def _update_speed_postfix(self) -> None:
+            if not self._is_bytes_bar:
+                return
+
+            now = time.monotonic()
+            n = float(self.n or 0)
+            elapsed = max(now - self._started_at, 1e-6)
+            avg_speed = n / elapsed
+            dt = now - self._last_t
+            dn = n - self._last_n
+            if dt >= 0.5 and dn > 0:
+                self._instant_speed = dn / dt
+                self._last_n = n
+                self._last_t = now
+            elif dt >= 8.0:
+                # 长时间没有新字节（HF 大 chunk 回调间隔可能很长），清空瞬时速度。
+                self._instant_speed = None
+                self._last_t = now
+
+            self._track_bytes()
+            if self.disable:
+                return
+            instant = _format_speed(self._instant_speed)
+            average = _format_speed(avg_speed if n > 0 else None)
+            self.set_postfix_str(f"cur={instant}, avg={average}", refresh=False)
+
+        def update(self, n: float | None = 1):
+            result = super().update(n)
+            self._update_speed_postfix()
+            return result
+
+        def close(self):
+            self._refresh_stop.set()
+            if self._refresh_thread is not None:
+                self._refresh_thread.join(timeout=1.0)
+                self._refresh_thread = None
+            self._update_speed_postfix()
+            return super().close()
+
+    return DownloadProgressTqdm
+
+
 def _cmd_download(args: argparse.Namespace) -> int:
     try:
         from huggingface_hub import snapshot_download
@@ -137,6 +257,12 @@ def _cmd_download(args: argparse.Namespace) -> int:
     else:
         print("状态: 未检测到 Token，尝试匿名下载...")
 
+    # huggingface_hub 在 logger 为 NOTSET 时会禁用字节进度条，只剩“Fetching N files”，
+    # 因而看不到下载速度。显式打开 INFO 以启用体积/速率进度条。
+    logging.getLogger("huggingface_hub").setLevel(logging.INFO)
+
+    started_at = time.monotonic()
+    progress_stats: dict = {"bytes": 0.0}
     try:
         download_kwargs = {
             "repo_id": args.repo_id,
@@ -144,12 +270,23 @@ def _cmd_download(args: argparse.Namespace) -> int:
             "local_dir": local_dir,
             "token": token,
             "max_workers": 8,
+            "tqdm_class": _build_download_tqdm_class(progress_stats),
         }
         if args.revision is not None:
             download_kwargs["revision"] = args.revision
 
         snapshot_download(**download_kwargs)
+        elapsed = max(time.monotonic() - started_at, 1e-6)
+        downloaded = float(progress_stats.get("bytes", 0.0))
         print(f"\n[成功] {args.type} 已下载至: {os.path.abspath(local_dir)}")
+        if downloaded > 0:
+            print(
+                f"传输量: {_format_bytes(downloaded)} | "
+                f"耗时: {elapsed:.1f}s | "
+                f"平均速度: {_format_speed(downloaded / elapsed)}"
+            )
+        else:
+            print(f"耗时: {elapsed:.1f}s（可能命中本地缓存，无新增传输）")
         return 0
     except Exception as e:
         print(f"\n[失败] 下载出错: {e}")
