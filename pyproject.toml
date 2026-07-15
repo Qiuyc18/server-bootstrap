@@ -9,3 +9,8 @@ dependencies = [
     "huggingface-hub>=1.12.2",
     "modelscope>=1.36.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]

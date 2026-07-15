@@ -8,7 +8,8 @@
 |------|------|
 | `init.sh` | 通用 Debian/Ubuntu：基础包、[ble.sh](https://github.com/akinomyoga/ble.sh)、[Oh My Bash](https://github.com/ohmybash/oh-my-bash)、`~/.ssh/id_ed25519`（若不存在）、[uv](https://docs.astral.sh/uv/) |
 | `init_on_amd.sh` | 在通用步骤基础上安装 Docker、OpenMPI，并写入 **vLLM ROCm 7 Docker** 相关配置（默认镜像 [`rocm/vllm-dev`](https://hub.docker.com/r/rocm/vllm-dev/tags)）。适用于宿主机仍为 ROCm 6.x（如 mi250-002）而 wheel 需 ROCm 7 的场景，避免裸机升级 ROCm；不生成 SSH 密钥 |
-| `download.py` | 基于 [huggingface-hub](https://huggingface.co/docs/huggingface_hub) 的 `search` / `download`，可选镜像与 Token |
+| `download.py` | Hugging Face / ModelScope 的 `search` / `download`；ModelScope 大文件走安全续传（`modelscope_safe_download.py`） |
+| `modelscope_safe_download.py` | ModelScope 安全分块下载：严格校验 HTTP 206 / Content-Range，避免截断 `.incomplete` |
 
 ## 系统要求
 
@@ -63,7 +64,7 @@ bash init.sh
 bash init_on_amd.sh
 ```
 
-## Hugging Face 下载工具（`download.py`）
+## Hugging Face / ModelScope 下载工具（`download.py`）
 
 在项目目录安装依赖并运行：
 
@@ -76,14 +77,69 @@ uv run python download.py download openai/gsm8k --type dataset
 uv run python download.py download Qwen/Qwen2.5-1.5B-Instruct --local-dir ./models/qwen
 ```
 
+### ModelScope 大模型（安全续传）
+
+默认的 ModelScope SDK 在服务端忽略 `Range`、返回 HTTP 200 时，可能用 `wb` 打开已有 `.incomplete`，把十几 GB 进度截断归零。本仓库对 `--source modelscope` 使用独立安全下载器：
+
+- **文件级并发**（`--max-workers`，默认 1）：同时下载多少个仓库文件
+- **文件内分块并发**（`--part-workers`，默认 4）：单个大文件同时拉多少个 Range 分块
+- **分块大小**（`--part-size-mb`，默认 160）：建议 128～256 MiB
+- 总 HTTP 连接上限约为 `max-workers × part-workers`（默认 1×4=4）
+- 所有非零偏移 Range 必须是 **HTTP 206**，且 **Content-Range / 长度严格匹配**；若返回 200：**绝不截断、绝不乱追加**，保留已有字节并失败退出
+
+推荐命令：
+
+```bash
+uv run python download.py download \
+  MiniMax/MiniMax-M3-MXFP8 \
+  --source modelscope \
+  --max-workers 1 \
+  --part-workers 4 \
+  --part-size-mb 160 \
+  --download-retries 10 \
+  --local-dir /data/checkpoints/MiniMax/MiniMax-M3-MXFP8
+```
+
+如何判断在续传：
+
+- 日志会出现 `复用已落盘字节` / `已从旧 .incomplete 安全提取可复用前缀` / `下载分块 ... (已有 …)`
+- 进度条基于**已安全落盘、重启可复用**的累计字节，不会在重试后无解释地从 13GB 跳回 0
+- 若服务端拒绝 Range，会看到类似：`服务器未接受 Range 请求；已保留现有 …，不会截断`
+
+旧临时文件兼容（默认不删除）：
+
+| 形态 | 行为 |
+|------|------|
+| `file.safetensors.incomplete` | 校验长度后，把完整分块前缀提取到 `.ms_parts/`；原文件保留 |
+| `file.safetensors_<start>_<end>` | 长度正好等于分块则复用；为零或异常则忽略并保留 |
+| `.ms_parts/file/.../part_*_{.ok,.part}` | 本实现自己的分块；长度不对会改名为 `.invalid` |
+
+确认最终文件无误后，可：
+
+- 按日志打印的 `rm -f …` 手动清理；或
+- 加 `--clean-temp`：仅在**本文件校验成功后**删除对应旧 `.incomplete` / legacy 分块
+
+`--force-restart-file`：仅当最终目标文件已存在但校验失败时，把旧文件改名为 `*.bad_existing` 再重下；**不会**在 Range 被拒绝时自动清空进度。
+
+ModelScope 专用参数（见 `download --help`）：`--part-workers`、`--part-size-mb`、`--download-retries`、`--download-timeout`、`--clean-temp`、`--force-restart-file`。
+
+本地离线测试（不访问公网）：
+
+```bash
+uv sync --group dev
+uv run python -m unittest tests.test_modelscope_safe_download -v
+```
+
 环境变量可在 shell 中 `export`，或在**仓库根目录**的 `.env` 里配置（`download.py` 启动时会 `load_dotenv()`，且会从同目录的 `.env` 读取 Token 键）：
 
-- **认证**：`HUGGINGFACE_API_TOKEN`、`HUGGINGFACE_HUB_TOKEN` 或 `HF_TOKEN`（私有或受限资源需要）；也可用 `download --token`
-- **镜像**：`HF_ENDPOINT`（默认探测 `https://hf-mirror.com`，不可达时回退官方站）
+- **认证（HF）**：`HUGGINGFACE_API_TOKEN`、`HUGGINGFACE_HUB_TOKEN` 或 `HF_TOKEN`
+- **认证（ModelScope）**：`MODELSCOPE_API_TOKEN` 或 `MODELSCOPE_TOKEN`；也可用 `download --token`
+- **镜像（HF）**：`HF_ENDPOINT`（默认探测 `https://hf-mirror.com`，不可达时回退官方站）
 - **默认下载目录**：`DEFAULT_MODEL_DIR`（模型，默认 `/etc/moreh/checkpoint/`）、`DEFAULT_DATA_DIR`（数据集，默认 `/etc/moreh/checkpoint/data/`）
 
 更多子命令说明可执行：
 
 ```bash
 uv run python download.py --help
+uv run python download.py download --help
 ```

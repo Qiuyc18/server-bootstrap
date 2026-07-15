@@ -38,8 +38,9 @@ DESCRIPTION_TEXT = dedent(f"""\
     4. 指定目录下载:
        python download.py download Qwen/Qwen2.5-1.5B-Instruct --local-dir tmp
 
-    5. 从 ModelScope 下载（公开仓库无需 Token）:
-       python download.py download Qwen/Qwen2.5-1.5B-Instruct --source modelscope
+    5. 从 ModelScope 下载（公开仓库无需 Token；大文件默认低文件并发 + 文件内分块）:
+       python download.py download MiniMax/MiniMax-M3-MXFP8 --source modelscope \\
+         --max-workers 1 --part-workers 4 --part-size-mb 160 --download-retries 10
     """)
 
 
@@ -274,32 +275,65 @@ def _download_from_hf(
 def _download_from_modelscope(
     args: argparse.Namespace, local_dir: str, token: str | None
 ) -> float:
-    try:
-        from modelscope.hub.snapshot_download import (
-            dataset_snapshot_download,
-            snapshot_download,
-        )
-    except ImportError:
-        raise RuntimeError(
-            "缺少依赖库 modelscope。请在虚拟环境中运行: "
-            "python -m pip install -U modelscope"
-        ) from None
+    # Env must be set before importing modelscope / modelscope_hub.
+    from modelscope_safe_download import (
+        DownloadConfig,
+        configure_modelscope_env,
+        format_bytes,
+        require_supported_modelscope_versions,
+        snapshot_download_safe,
+    )
 
-    download_kwargs = {
-        "local_dir": local_dir,
-        "token": token,
-        "max_workers": args.max_workers,
-    }
-    if args.revision is not None:
-        download_kwargs["revision"] = args.revision
+    file_workers = args.max_workers
+    part_workers = args.part_workers
+    part_size_mb = args.part_size_mb
+    retries = args.download_retries
+    timeout = args.download_timeout
 
-    if args.type == "dataset":
-        dataset_snapshot_download(dataset_id=args.repo_id, **download_kwargs)
-    else:
-        snapshot_download(model_id=args.repo_id, **download_kwargs)
+    configure_modelscope_env(
+        file_workers=file_workers,
+        part_workers=part_workers,
+        part_size_mb=part_size_mb,
+        retries=retries,
+        timeout=timeout,
+    )
 
-    # ModelScope 自带下载进度和速度显示，无需注入 HF 的 tqdm 实现。
-    return 0.0
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+
+    ms_ver, hub_ver = require_supported_modelscope_versions()
+    print(f"ModelScope SDK: modelscope={ms_ver}, modelscope-hub={hub_ver}")
+    print(
+        "安全下载策略: "
+        f"file_workers={file_workers}, part_workers={part_workers}, "
+        f"part_size={part_size_mb}MiB, retries={retries}, timeout={timeout}s"
+    )
+
+    config = DownloadConfig(
+        file_workers=file_workers,
+        part_workers=part_workers,
+        part_size=part_size_mb * 1024 * 1024,
+        retries=retries,
+        timeout=timeout,
+        clean_temp=bool(args.clean_temp),
+        force_restart_file=bool(args.force_restart_file),
+    )
+    _path, stats = snapshot_download_safe(
+        args.repo_id,
+        local_dir=local_dir,
+        repo_type=args.type,
+        revision=args.revision,
+        token=token,
+        config=config,
+    )
+    downloaded = float(sum(s.downloaded_bytes for s in stats))
+    reused = float(sum(s.reused_bytes for s in stats))
+    if reused > 0:
+        print(f"复用已落盘字节: {format_bytes(reused)}")
+    return downloaded
 
 
 def _cmd_download(args: argparse.Namespace) -> int:
@@ -396,14 +430,74 @@ def main() -> int:
     download_parser.add_argument(
         "--max-workers",
         type=int,
-        default=8,
-        help="并发下载线程数（默认: 8）",
+        default=None,
+        help=(
+            "文件级并发数：同时下载多少个仓库文件。"
+            "Hugging Face 默认 8；ModelScope 安全下载默认 1。"
+        ),
+    )
+    download_parser.add_argument(
+        "--part-workers",
+        type=int,
+        default=4,
+        help=(
+            "ModelScope only: 单文件内 Range 分块并发数（默认 4）。"
+            "总 HTTP 连接上限约为 max-workers × part-workers。"
+        ),
+    )
+    download_parser.add_argument(
+        "--part-size-mb",
+        type=int,
+        default=160,
+        help="ModelScope only: 分块大小 MiB（默认 160，建议 128～256）",
+    )
+    download_parser.add_argument(
+        "--download-retries",
+        type=int,
+        default=10,
+        help="ModelScope only: 单个分块下载失败时的最大重试次数（默认 10）",
+    )
+    download_parser.add_argument(
+        "--download-timeout",
+        type=int,
+        default=60,
+        help="ModelScope only: 单次 HTTP 超时秒数（默认 60）",
+    )
+    download_parser.add_argument(
+        "--clean-temp",
+        action="store_true",
+        help=(
+            "ModelScope only: 最终文件校验成功后，删除已成功合并对应的旧 "
+            ".incomplete / legacy 分块；默认只打印手动清理命令"
+        ),
+    )
+    download_parser.add_argument(
+        "--force-restart-file",
+        action="store_true",
+        help=(
+            "ModelScope only: 当目标最终文件存在但校验失败时，允许重新下载并替换；"
+            "不会在服务器拒绝 Range 时自动截断已有分块进度"
+        ),
     )
     download_parser.add_argument("--revision", default=None, help="分支或 Commit ID")
     download_parser.add_argument("--local-dir", default=None, help="下载目标路径")
     download_parser.set_defaults(func=_cmd_download)
 
     args = parser.parse_args()
+    if getattr(args, "command", None) == "download":
+        if args.max_workers is None:
+            args.max_workers = 1 if args.source == "modelscope" else 8
+        if args.max_workers < 1:
+            parser.error("--max-workers 必须 >= 1")
+        if args.source == "modelscope":
+            if args.part_workers < 1:
+                parser.error("--part-workers 必须 >= 1")
+            if args.part_size_mb < 1:
+                parser.error("--part-size-mb 必须 >= 1")
+            if args.download_retries < 1:
+                parser.error("--download-retries 必须 >= 1")
+            if args.download_timeout < 1:
+                parser.error("--download-timeout 必须 >= 1")
     return args.func(args)
 
 
