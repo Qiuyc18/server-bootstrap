@@ -37,10 +37,19 @@ DESCRIPTION_TEXT = dedent(f"""\
 
     4. 指定目录下载:
        python download.py download Qwen/Qwen2.5-1.5B-Instruct --local-dir tmp
+
+    5. 从 ModelScope 下载（公开仓库无需 Token）:
+       python download.py download Qwen/Qwen2.5-1.5B-Instruct --source modelscope
     """)
 
 
-def _read_env_token(env_path: Path) -> str | None:
+TOKEN_ENV_KEYS = {
+    "hf": ("HUGGINGFACE_API_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"),
+    "modelscope": ("MODELSCOPE_API_TOKEN", "MODELSCOPE_TOKEN"),
+}
+
+
+def _read_env_token(env_path: Path, keys: tuple[str, ...]) -> str | None:
     if not env_path.exists():
         return None
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -50,25 +59,21 @@ def _read_env_token(env_path: Path) -> str | None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key in {"HUGGINGFACE_API_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"}:
+        if key in keys:
             return value or None
     return None
 
 
-def _get_token(token: str | None = None) -> str | None:
+def _get_token(source: str, token: str | None = None) -> str | None:
     if token:
         return token
+
+    keys = TOKEN_ENV_KEYS[source]
     repo_root = Path(__file__).resolve().parent
-    token = _read_env_token(repo_root / ".env") or os.environ.get(
-        "HUGGINGFACE_API_TOKEN"
-    )
+    token = _read_env_token(repo_root / ".env", keys)
     if token:
         return token
-    return (
-        os.environ.get("HUGGINGFACE_API_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or os.environ.get("HF_TOKEN")
-    )
+    return next((value for key in keys if (value := os.environ.get(key))), None)
 
 
 def _is_endpoint_reachable(endpoint: str, timeout: int = 5) -> bool:
@@ -99,13 +104,14 @@ def _configure_hf_endpoint_or_exit() -> None:
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
+    _configure_hf_endpoint_or_exit()
     try:
         from huggingface_hub import HfApi
     except ImportError:
         print("Missing dependency: huggingface_hub. Please install it first.")
         return 1
 
-    api = HfApi(token=_get_token())
+    api = HfApi(token=_get_token("hf"))
     if args.type == "dataset":
         results = api.list_datasets(search=args.query, limit=args.limit)
         for ds in results:
@@ -234,14 +240,70 @@ def _build_download_tqdm_class(stats: dict):
     return DownloadProgressTqdm
 
 
-def _cmd_download(args: argparse.Namespace) -> int:
+def _download_from_hf(
+    args: argparse.Namespace, local_dir: str, token: str | None
+) -> float:
+    _configure_hf_endpoint_or_exit()
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        print("错误: 缺少依赖库 huggingface_hub。请先运行: pip install huggingface_hub")
-        return 1
+        raise RuntimeError(
+            "缺少依赖库 huggingface_hub。请先运行: pip install huggingface_hub"
+        )
 
-    token = _get_token(args.token)
+    # huggingface_hub 在 logger 为 NOTSET 时会禁用字节进度条，只剩“Fetching N files”，
+    # 因而看不到下载速度。显式打开 INFO 以启用体积/速率进度条。
+    logging.getLogger("huggingface_hub").setLevel(logging.INFO)
+
+    progress_stats: dict = {"bytes": 0.0}
+    download_kwargs = {
+        "repo_id": args.repo_id,
+        "repo_type": args.type,
+        "local_dir": local_dir,
+        "token": token,
+        "max_workers": args.max_workers,
+        "tqdm_class": _build_download_tqdm_class(progress_stats),
+    }
+    if args.revision is not None:
+        download_kwargs["revision"] = args.revision
+
+    snapshot_download(**download_kwargs)
+    return float(progress_stats.get("bytes", 0.0))
+
+
+def _download_from_modelscope(
+    args: argparse.Namespace, local_dir: str, token: str | None
+) -> float:
+    try:
+        from modelscope.hub.snapshot_download import (
+            dataset_snapshot_download,
+            snapshot_download,
+        )
+    except ImportError:
+        raise RuntimeError(
+            "缺少依赖库 modelscope。请在虚拟环境中运行: "
+            "python -m pip install -U modelscope"
+        ) from None
+
+    download_kwargs = {
+        "local_dir": local_dir,
+        "token": token,
+        "max_workers": args.max_workers,
+    }
+    if args.revision is not None:
+        download_kwargs["revision"] = args.revision
+
+    if args.type == "dataset":
+        dataset_snapshot_download(dataset_id=args.repo_id, **download_kwargs)
+    else:
+        snapshot_download(model_id=args.repo_id, **download_kwargs)
+
+    # ModelScope 自带下载进度和速度显示，无需注入 HF 的 tqdm 实现。
+    return 0.0
+
+
+def _cmd_download(args: argparse.Namespace) -> int:
+    token = _get_token(args.source, args.token)
 
     # 路径处理逻辑：若用户指定了 local_dir 则使用，否则根据 type 走默认路径
     if args.local_dir:
@@ -250,34 +312,21 @@ def _cmd_download(args: argparse.Namespace) -> int:
         base_dir = DEFAULT_DATA_DIR if args.type == "dataset" else DEFAULT_MODEL_DIR
         local_dir = str(Path(base_dir) / args.repo_id)
 
-    print(f"准备下载 [{args.type}]: {args.repo_id}")
+    print(f"准备从 {args.source} 下载 [{args.type}]: {args.repo_id}")
     print(f"目标路径: {local_dir}")
     if token:
         print("状态: 使用已认证 Token")
     else:
         print("状态: 未检测到 Token，尝试匿名下载...")
 
-    # huggingface_hub 在 logger 为 NOTSET 时会禁用字节进度条，只剩“Fetching N files”，
-    # 因而看不到下载速度。显式打开 INFO 以启用体积/速率进度条。
-    logging.getLogger("huggingface_hub").setLevel(logging.INFO)
-
     started_at = time.monotonic()
-    progress_stats: dict = {"bytes": 0.0}
     try:
-        download_kwargs = {
-            "repo_id": args.repo_id,
-            "repo_type": args.type,  # 关键点：告诉 HF 下载的是模型还是数据集
-            "local_dir": local_dir,
-            "token": token,
-            "max_workers": 8,
-            "tqdm_class": _build_download_tqdm_class(progress_stats),
-        }
-        if args.revision is not None:
-            download_kwargs["revision"] = args.revision
+        if args.source == "modelscope":
+            downloaded = _download_from_modelscope(args, local_dir, token)
+        else:
+            downloaded = _download_from_hf(args, local_dir, token)
 
-        snapshot_download(**download_kwargs)
         elapsed = max(time.monotonic() - started_at, 1e-6)
-        downloaded = float(progress_stats.get("bytes", 0.0))
         print(f"\n[成功] {args.type} 已下载至: {os.path.abspath(local_dir)}")
         if downloaded > 0:
             print(
@@ -286,18 +335,21 @@ def _cmd_download(args: argparse.Namespace) -> int:
                 f"平均速度: {_format_speed(downloaded / elapsed)}"
             )
         else:
-            print(f"耗时: {elapsed:.1f}s（可能命中本地缓存，无新增传输）")
+            print(f"耗时: {elapsed:.1f}s（详细传输速度见上方下载进度）")
         return 0
     except Exception as e:
         print(f"\n[失败] 下载出错: {e}")
         if "401" in str(e) or "403" in str(e):
-            print("提示: 此资源可能需要权限认证。请提供有效的 HF_TOKEN。")
+            token_name = (
+                "MODELSCOPE_API_TOKEN"
+                if args.source == "modelscope"
+                else "HF_TOKEN"
+            )
+            print(f"提示: 此资源可能需要权限认证。请提供有效的 {token_name}。")
         return 1
 
 
 def main() -> int:
-    _configure_hf_endpoint_or_exit()
-
     parser = argparse.ArgumentParser(
         description=DESCRIPTION_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -306,7 +358,7 @@ def main() -> int:
     # 全局参数
     parser.add_argument(
         "--token",
-        help="HuggingFace Token (可选，也可以通过环境变量设置）",
+        help="HF/ModelScope Token（可选，也可以通过环境变量设置）",
         default=None,
     )
 
@@ -334,6 +386,18 @@ def main() -> int:
         choices=["model", "dataset"],
         default="model",
         help="下载类型 (model 或 dataset)",
+    )
+    download_parser.add_argument(
+        "--source",
+        choices=["hf", "modelscope"],
+        default="hf",
+        help="下载源（默认: hf）",
+    )
+    download_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="并发下载线程数（默认: 8）",
     )
     download_parser.add_argument("--revision", default=None, help="分支或 Commit ID")
     download_parser.add_argument("--local-dir", default=None, help="下载目标路径")

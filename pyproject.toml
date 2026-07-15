@@ -7,4 +7,5 @@ requires-python = ">=3.10"
 dependencies = [
     "dotenv>=0.9.9",
     "huggingface-hub>=1.12.2",
+    "modelscope>=1.36.1",
 ]
