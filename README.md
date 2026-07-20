@@ -8,6 +8,7 @@
 |------|------|
 | `init.sh` | 通用 Debian/Ubuntu：基础包、[ble.sh](https://github.com/akinomyoga/ble.sh)、[Oh My Bash](https://github.com/ohmybash/oh-my-bash)、SSH 密钥生成命令提示、[uv](https://docs.astral.sh/uv/) |
 | `init_on_amd.sh` | 在通用步骤基础上安装 Docker、OpenMPI，并写入 **vLLM ROCm 7 Docker** 相关配置（默认镜像 [`rocm/vllm-dev`](https://hub.docker.com/r/rocm/vllm-dev/tags)）。适用于宿主机仍为 ROCm 6.x（如 mi250-002）而 wheel 需 ROCm 7 的场景，避免裸机升级 ROCm；不生成 SSH 密钥 |
+| `install_rocm_gb.sh` | 单独安装 `rocm-monitor.py`，并将 `rocm-gb` alias 幂等地添加到 `~/.bashrc` |
 | `download.py` | Hugging Face / ModelScope 的 `search` / `download`；ModelScope 大文件走安全续传（`modelscope_safe_download.py`） |
 | `modelscope_safe_download.py` | ModelScope 安全分块下载：严格校验 Range 状态、响应头与响应体，避免截断 `.incomplete` |
 
@@ -31,6 +32,18 @@ curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init_
 ```
 
 使用自己的 fork 或分支时，将 URL 中的 `Qiuyc18/server-bootstrap` 与 `main` 改成你的仓库与分支名即可。
+
+## 安装 rocm-gb GPU 监控命令
+
+在 AMD ROCm 服务器上，可以独立安装 GPU 显存与进程监控命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/install_rocm_gb.sh | bash
+source ~/.bashrc
+rocm-gb
+```
+
+脚本会把监控程序安装到 `~/rocm-monitor.py`，并在 `~/.bashrc` 中添加 `rocm-gb` alias。重复运行不会重复添加 alias。运行时需要 `python3`、`watch` 和 `rocm-smi`；若系统提供 `amd-smi`，监控脚本会优先使用它获取更准确的进程与 GPU 映射。
 
 ## 常见问题
 
