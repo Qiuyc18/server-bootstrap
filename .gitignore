@@ -71,6 +71,8 @@ examples/output/
 examples/results/
 
 ### 开发辅助工具 ###
+.trunk/
+
 # TensorBoard日志
 runs/
 tensorboard/

@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 检查是否能执行需要 root 权限的系统初始化。无权限时仍继续用户级初始化。
+ROOT_CMD=()
+if [ "$(id -u)" -eq 0 ]; then
+  :
+elif command -v sudo >/dev/null 2>&1 && sudo -v; then
+  ROOT_CMD=(sudo)
+else
+  echo "提示：当前用户没有 sudo 权限，将跳过系统软件包安装。"
+fi
+
 # 非交互 apt：避免 needrestart / 内核待重启 等 whiptail 在 SSH 里弹窗
 apt_get() {
-  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
+  "${ROOT_CMD[@]}" env DEBIAN_FRONTEND=noninteractive \
+    NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
 }
 
 echo "==== 1. 安装基础工具 ===="
-apt_get update
-apt_get install -y curl git xz-utils ca-certificates openssh-client ffmpeg
+if [ "$(id -u)" -eq 0 ] || [ "${#ROOT_CMD[@]}" -gt 0 ]; then
+  apt_get update
+  apt_get install -y curl git xz-utils ca-certificates openssh-client ffmpeg
+else
+  echo "跳过基础工具安装；请联系管理员安装: curl git xz-utils ca-certificates openssh-client ffmpeg"
+fi
 
 echo "==== 2. 安装 ble.sh ===="
 

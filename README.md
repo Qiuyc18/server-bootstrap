@@ -6,14 +6,14 @@
 
 | 文件 | 说明 |
 |------|------|
-| `init.sh` | 通用 Debian/Ubuntu：基础包、[ble.sh](https://github.com/akinomyoga/ble.sh)、[Oh My Bash](https://github.com/ohmybash/oh-my-bash)、`~/.ssh/id_ed25519`（若不存在）、[uv](https://docs.astral.sh/uv/) |
+| `init.sh` | 通用 Debian/Ubuntu：基础包、[ble.sh](https://github.com/akinomyoga/ble.sh)、[Oh My Bash](https://github.com/ohmybash/oh-my-bash)、SSH 密钥生成命令提示、[uv](https://docs.astral.sh/uv/) |
 | `init_on_amd.sh` | 在通用步骤基础上安装 Docker、OpenMPI，并写入 **vLLM ROCm 7 Docker** 相关配置（默认镜像 [`rocm/vllm-dev`](https://hub.docker.com/r/rocm/vllm-dev/tags)）。适用于宿主机仍为 ROCm 6.x（如 mi250-002）而 wheel 需 ROCm 7 的场景，避免裸机升级 ROCm；不生成 SSH 密钥 |
 | `download.py` | Hugging Face / ModelScope 的 `search` / `download`；ModelScope 大文件走安全续传（`modelscope_safe_download.py`） |
 | `modelscope_safe_download.py` | ModelScope 安全分块下载：严格校验 Range 状态、响应头与响应体，避免截断 `.incomplete` |
 
 ## 系统要求
 
-- **Shell 脚本**：带 `apt` 的发行版（如 Debian、Ubuntu），当前用户有 `sudo`，网络可访问 GitHub、astral.sh；`init_on_amd.sh` 会安装 `docker.io` 并配置 `vllm_rocm_shell`（需能拉取 Docker Hub 上的 `rocm/vllm-dev`）。
+- **Shell 脚本**：适用于带 `apt` 的发行版（如 Debian、Ubuntu），网络需能访问 GitHub、astral.sh。有 root 或 `sudo` 权限时会安装系统依赖；无 `sudo` 权限时跳过该步骤，继续安装用户目录下的 shell 工具和 uv，此时缺失的基础命令需由管理员安装。`init_on_amd.sh` 仅在有权限时安装、启动 `docker.io` 并配置用户组，但无权限时仍会生成 `vllm_rocm_shell` 配置（需管理员预先安装 Docker 并授予使用权限）。
 - **Python 工具**：Python ≥ 3.10；推荐用本仓库的 [uv](https://docs.astral.sh/uv/) 管理依赖。
 
 ## 一键安装（远程 raw）

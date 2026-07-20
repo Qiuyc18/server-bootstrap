@@ -7,9 +7,20 @@
 #
 set -euo pipefail
 
+# 检查是否能执行需要 root 权限的系统初始化。无权限时仍继续用户级初始化。
+ROOT_CMD=()
+if [ "$(id -u)" -eq 0 ]; then
+  :
+elif command -v sudo >/dev/null 2>&1 && sudo -v; then
+  ROOT_CMD=(sudo)
+else
+  echo "提示：当前用户没有 sudo 权限，将跳过系统软件包与 Docker 系统配置。"
+fi
+
 # 非交互 apt：避免 needrestart / 内核待重启 等 whiptail 在 SSH 里弹窗（见 README 说明）
 apt_get() {
-  sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
+  "${ROOT_CMD[@]}" env DEBIAN_FRONTEND=noninteractive \
+    NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
 }
 
 NEEDRESTART_MODE=l
@@ -19,17 +30,24 @@ DOCKER_RC="${CONFIG_DIR}/vllm-rocm-docker.sh"
 BASHRC_MARKER="# server-bootstrap: vllm-rocm-docker (managed)"
 
 echo "==== 1. 安装基础工具 ===="
-apt_get update
-apt_get install -y curl git xz-utils ca-certificates openssh-client openmpi-bin libopenmpi-dev docker.io
-sudo ldconfig
+if [ "$(id -u)" -eq 0 ] || [ "${#ROOT_CMD[@]}" -gt 0 ]; then
+  apt_get update
+  apt_get install -y curl git xz-utils ca-certificates openssh-client openmpi-bin libopenmpi-dev docker.io
+  "${ROOT_CMD[@]}" ldconfig
 
-if command -v systemctl >/dev/null 2>&1; then
-  sudo systemctl enable --now docker 2>/dev/null || true
-fi
+  if command -v systemctl >/dev/null 2>&1; then
+    "${ROOT_CMD[@]}" systemctl enable --now docker 2>/dev/null || true
+  fi
 
-if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
-  sudo usermod -aG docker "$USER"
-  echo "已将当前用户加入 docker 组；生效需重新登录或执行: newgrp docker"
+  if ! id -nG "${USER:-$(id -un)}" | tr ' ' '\n' | grep -qx docker; then
+    "${ROOT_CMD[@]}" usermod -aG docker "${USER:-$(id -un)}"
+    echo "已将当前用户加入 docker 组；生效需重新登录或执行: newgrp docker"
+  fi
+else
+  echo "跳过系统依赖安装；请联系管理员安装: curl git xz-utils ca-certificates openssh-client openmpi-bin libopenmpi-dev docker.io"
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "警告：未找到 docker，vllm_rocm_shell 需管理员安装并授权 Docker 后才能使用。"
+  fi
 fi
 
 echo "==== 2. 安装 ble.sh ===="

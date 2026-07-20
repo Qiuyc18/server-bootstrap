@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 检查是否能执行需要 root 权限的系统初始化。无权限时仍继续用户级初始化。
+ROOT_CMD=()
+if [ "$(id -u)" -eq 0 ]; then
+  :
+elif command -v sudo >/dev/null 2>&1 && sudo -v; then
+  ROOT_CMD=(sudo)
+else
+  echo "提示：当前用户没有 sudo 权限，将跳过系统软件包安装。"
+fi
+
 # 非交互 apt：避免 needrestart / 内核待重启 等 whiptail 在 SSH 里弹窗
 apt_get() {
-  sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
+  "${ROOT_CMD[@]}" env DEBIAN_FRONTEND=noninteractive \
+    NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}" apt-get "$@"
 }
 
 echo "==== 1. 安装基础工具 ===="
-apt_get update
-apt_get install -y curl git xz-utils ca-certificates openssh-client
+if [ "$(id -u)" -eq 0 ] || [ "${#ROOT_CMD[@]}" -gt 0 ]; then
+  apt_get update
+  apt_get install -y curl git xz-utils ca-certificates openssh-client
+else
+  echo "跳过基础工具安装；请联系管理员安装: curl git xz-utils ca-certificates openssh-client"
+fi
 
 echo "==== 2. 安装 ble.sh ===="
 
@@ -51,14 +66,13 @@ else
   echo "oh-my-bash 已存在，跳过"
 fi
 
-echo "==== 4. 生成 ed25519 密钥 ===="
+echo "==== 4. 检查 SSH 密钥 ===="
 
 if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
-  mkdir -p "$HOME/.ssh"
-  chmod 700 "$HOME/.ssh"
-  ssh-keygen -t ed25519 -C "$(whoami)@$(hostname)" -f "$HOME/.ssh/id_ed25519" -N ""
+  echo "未找到 ~/.ssh/id_ed25519。如需生成，请手动执行："
+  echo "  ssh-keygen -t ed25519 -C \"$(whoami)@$(hostname)\" -f \"$HOME/.ssh/id_ed25519\""
 else
-  echo "SSH 密钥已存在，跳过"
+  echo "SSH 密钥已存在"
 fi
 
 echo "==== 5. 安装 uv ===="
