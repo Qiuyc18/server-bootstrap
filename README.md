@@ -43,7 +43,7 @@ source ~/.bashrc
 rocm-gb
 ```
 
-脚本会把监控程序安装到 `~/rocm-monitor.py`，并在 `~/.bashrc` 中添加 `rocm-gb` alias。重复运行不会重复添加 alias。运行时需要 `python3`、`watch` 和 `rocm-smi`；若系统提供 `amd-smi`，监控脚本会优先使用它获取更准确的进程与 GPU 映射。
+脚本会把监控程序安装到 `~/rocm-monitor.py`，并在 `~/.bashrc` 中添加 `rocm-gb` alias，默认每 5 秒刷新一次。重复运行会更新脚本管理的 alias，不会重复添加。可通过 `ROCM_GB_INTERVAL` 调整刷新秒数，例如 `curl … | ROCM_GB_INTERVAL=10 bash`。运行时需要 `python3`、`watch` 和 `rocm-smi`；若系统提供 `amd-smi`，监控脚本会优先使用它获取更准确的进程与 GPU 映射。
 
 ## 常见问题
 
