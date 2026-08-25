@@ -25,6 +25,14 @@
 curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init.sh | bash
 ```
 
+在国内网络环境中，可让脚本本身以及脚本内的 GitHub release 下载、`git clone` 都通过 GitHub 代理：
+
+```bash
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init.sh | bash -s -- --gh_proxy
+```
+
+本地运行时使用 `bash init.sh --gh_proxy`。如需改用其他兼容的代理服务，可设置 `GH_PROXY_BASE`。
+
 AMD 服务器：Shell、uv、Docker，以及 **vLLM 官方 ROCm 7 容器** 的本地参数（见脚本内 mi250-002 / ROCm 6.x 与 rocm722 wheel 的说明）。安装后请编辑 `~/.config/server-bootstrap/vllm-rocm.env` 中的镜像 tag，执行 `docker pull`，再用 `vllm_rocm_shell` 进入容器。
 
 ```bash

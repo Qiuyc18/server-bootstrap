@@ -1,6 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+GH_PROXY_ENABLED=false
+GH_PROXY_BASE="${GH_PROXY_BASE:-https://gh-proxy.com}"
+
+usage() {
+  cat <<'EOF'
+用法: bash init.sh [选项]
+
+选项:
+  --gh_proxy  通过国内 GitHub 代理下载 GitHub 资源
+  -h, --help  显示帮助
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --gh_proxy)
+      GH_PROXY_ENABLED=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "错误：未知选项: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+github_url() {
+  local url="$1"
+
+  if [ "$GH_PROXY_ENABLED" = true ]; then
+    printf '%s/%s\n' "${GH_PROXY_BASE%/}" "$url"
+  else
+    printf '%s\n' "$url"
+  fi
+}
+
+if [ "$GH_PROXY_ENABLED" = true ]; then
+  echo "GitHub 国内代理已启用: ${GH_PROXY_BASE%/}"
+fi
+
 # 检查是否能执行需要 root 权限的系统初始化。无权限时仍继续用户级初始化。
 ROOT_CMD=()
 if [ "$(id -u)" -eq 0 ]; then
@@ -32,7 +77,7 @@ if [ ! -d "$HOME/.local/share/blesh" ]; then
   cd "$tmpdir"
 
   curl -fL --connect-timeout 10 --retry 3 \
-    https://github.com/akinomyoga/ble.sh/releases/download/nightly/ble-nightly.tar.xz \
+    "$(github_url 'https://github.com/akinomyoga/ble.sh/releases/download/nightly/ble-nightly.tar.xz')" \
     -o ble-nightly.tar.xz
 
   tar xJf ble-nightly.tar.xz
@@ -50,7 +95,9 @@ fi
 echo "==== 3. 安装 oh-my-bash ===="
 
 if [ ! -d "$HOME/.oh-my-bash" ]; then
-  git clone --depth=1 https://github.com/ohmybash/oh-my-bash.git "$HOME/.oh-my-bash"
+  git clone --depth=1 \
+    "$(github_url 'https://github.com/ohmybash/oh-my-bash.git')" \
+    "$HOME/.oh-my-bash"
   cp "$HOME/.oh-my-bash/templates/bashrc.osh-template" "$HOME/.bashrc.oh-my-bash"
 
   if ! grep -q ".oh-my-bash/oh-my-bash.sh" "$HOME/.bashrc"; then
