@@ -9,6 +9,8 @@
 | `init.sh` | 通用 Debian/Ubuntu：基础包、[ble.sh](https://github.com/akinomyoga/ble.sh)、[Oh My Bash](https://github.com/ohmybash/oh-my-bash)、SSH 密钥生成命令提示、[uv](https://docs.astral.sh/uv/) |
 | `init_on_amd.sh` | 在通用步骤基础上安装 Docker、OpenMPI，并写入 **vLLM ROCm 7 Docker** 相关配置（默认镜像 [`rocm/vllm-dev`](https://hub.docker.com/r/rocm/vllm-dev/tags)）。适用于宿主机仍为 ROCm 6.x（如 mi250-002）而 wheel 需 ROCm 7 的场景，避免裸机升级 ROCm；不生成 SSH 密钥 |
 | `install_rocm_gb.sh` | 单独安装 `rocm-monitor.py`，并将 `rocm-gb` alias 幂等地添加到 `~/.bashrc` |
+| `h800_audit.sh` | NVIDIA H800 分层验收：只读盘点、DCGM 健康检查、PyTorch/NCCL 基准和 fio 存储测试 |
+| `h800_torch_benchmark.py` | `h800_audit.sh --benchmark` 调用的 8 卡并行 GEMM、HBM、PCIe、P2P 和 NCCL 基准 |
 | `download.py` | Hugging Face / ModelScope 的 `search` / `download`；ModelScope 大文件走安全续传（`modelscope_safe_download.py`） |
 | `modelscope_safe_download.py` | ModelScope 安全分块下载：严格校验 Range 状态、响应头与响应体，避免截断 `.incomplete` |
 
@@ -25,13 +27,14 @@
 curl -fsSL https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init.sh | bash
 ```
 
-在国内网络环境中，可让脚本本身以及脚本内的 GitHub release 下载、`git clone` 都通过 GitHub 代理：
+在国内网络环境中，可让脚本本身以及脚本内的 GitHub release、仓库归档下载都通过 GitHub 代理：
 
 ```bash
 curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/Qiuyc18/server-bootstrap/main/init.sh | bash -s -- --gh_proxy
 ```
 
 本地运行时使用 `bash init.sh --gh_proxy`。如需改用其他兼容的代理服务，可设置 `GH_PROXY_BASE`。
+代理模式下 Oh My Bash 使用仓库归档安装，并自动禁用依赖 Git 元数据的内置更新检查。
 
 AMD 服务器：Shell、uv、Docker，以及 **vLLM 官方 ROCm 7 容器** 的本地参数（见脚本内 mi250-002 / ROCm 6.x 与 rocm722 wheel 的说明）。安装后请编辑 `~/.config/server-bootstrap/vllm-rocm.env` 中的镜像 tag，执行 `docker pull`，再用 `vllm_rocm_shell` 进入容器。
 
@@ -52,6 +55,43 @@ rocm-gb
 ```
 
 脚本会把监控程序安装到 `~/rocm-monitor.py`，并在 `~/.bashrc` 中添加 `rocm-gb` alias，默认每 5 秒刷新一次。重复运行会更新脚本管理的 alias，不会重复添加。可通过 `ROCM_GB_INTERVAL` 调整刷新秒数，例如 `curl … | ROCM_GB_INTERVAL=10 bash`。运行时需要 `python3`、`watch` 和 `rocm-smi`；若系统提供 `amd-smi`，监控脚本会优先使用它获取更准确的进程与 GPU 映射。
+
+## H800 基础验收
+
+先把两个脚本放到目标机的同一目录：
+
+```bash
+ssh testH800-1 'mkdir -p /tmp/h800-audit'
+scp h800_audit.sh h800_torch_benchmark.py testH800-1:/tmp/h800-audit/
+```
+
+默认盘点只读，不安装软件，也不改变 GPU 配置：
+
+```bash
+ssh testH800-1 '/tmp/h800-audit/h800_audit.sh --inventory'
+```
+
+DCGM Level 2 会对空闲 GPU 施加测试负载。`--temporary-persistence` 只临时开启原本关闭的卡，完成或退出时恢复原状态：
+
+```bash
+ssh testH800-1 \
+  '/tmp/h800-audit/h800_audit.sh --health --health-level 2 --temporary-persistence'
+```
+
+安装 CUDA 版 PyTorch 后，可跑单卡算力/带宽、8 卡 NCCL 基准；脚本检测到已有 GPU 计算进程时默认拒绝运行：
+
+```bash
+ssh testH800-1 \
+  '/tmp/h800-audit/h800_audit.sh --benchmark --temporary-persistence'
+```
+
+存储测试会在 `/data` 创建唯一命名的临时文件并在完成后删除：
+
+```bash
+ssh testH800-1 '/tmp/h800-audit/h800_audit.sh --fio --fio-size 8G'
+```
+
+双节点最终结论见 [`H800_DUAL_NODE_HARDWARE_PERFORMANCE_FINAL_REPORT_2026-08-25.md`](H800_DUAL_NODE_HARDWARE_PERFORMANCE_FINAL_REPORT_2026-08-25.md)；`testH800-1` 的早期盘点记录见 [`H800_TESTH800_1_AUDIT_2026-08-25.md`](H800_TESTH800_1_AUDIT_2026-08-25.md)。
 
 ## 常见问题
 
