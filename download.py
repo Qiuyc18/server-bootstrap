@@ -20,7 +20,7 @@ dotenv.load_dotenv()
 DEFAULT_MODEL_DIR = os.getenv("DEFAULT_MODEL_DIR", "/etc/moreh/checkpoint/")
 DEFAULT_DATA_DIR = os.getenv("DEFAULT_DATA_DIR", "/etc/moreh/checkpoint/data/")
 HF_PRIMARY_ENDPOINT = "https://huggingface.co"
-HF_MIRROR_ENDPOINT = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
+HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
 
 # --- 文档说明 ---
 DESCRIPTION_TEXT = dedent(f"""\
@@ -41,6 +41,9 @@ DESCRIPTION_TEXT = dedent(f"""\
     5. 从 ModelScope 下载（公开仓库无需 Token；大文件默认低文件并发 + 文件内分块）:
        python download.py download MiniMax/MiniMax-M3-MXFP8 --source modelscope \\
          --max-workers 1 --part-workers 4 --part-size-mb 160 --download-retries 10
+
+    6. 强制从 HF 镜像下载（不自动回退主站）:
+       python download.py download MiniMaxAI/MiniMax-H3 --source hf-mirror
     """)
 
 
@@ -69,7 +72,7 @@ def _get_token(source: str, token: str | None = None) -> str | None:
     if token:
         return token
 
-    keys = TOKEN_ENV_KEYS[source]
+    keys = TOKEN_ENV_KEYS["hf" if source == "hf-mirror" else source]
     repo_root = Path(__file__).resolve().parent
     token = _read_env_token(repo_root / ".env", keys)
     if token:
@@ -90,29 +93,39 @@ def _is_endpoint_reachable(endpoint: str, timeout: int = 5) -> bool:
         return False
 
 
-def _configure_hf_endpoint_or_exit() -> None:
+def _configure_hf_endpoint_or_exit(endpoint: str | None = None) -> str:
+    # 显式配置优先于自动探测，避免镜像探测超时后意外切回主站。
+    endpoint = endpoint or os.getenv("HF_ENDPOINT")
+    if endpoint:
+        endpoint = endpoint.rstrip("/")
+        os.environ["HF_ENDPOINT"] = endpoint
+        print(f"使用指定 HF 站点: {endpoint}（不自动回退）")
+        return endpoint
+
     print(f"连通性测试: 镜像站 {HF_MIRROR_ENDPOINT}")
     if _is_endpoint_reachable(HF_MIRROR_ENDPOINT):
         os.environ["HF_ENDPOINT"] = HF_MIRROR_ENDPOINT
         print("连通性测试结果: 镜像站可用")
-        return
-    else:
-        print(f"连通性测试: 主站 {HF_PRIMARY_ENDPOINT}")
-        if _is_endpoint_reachable(HF_PRIMARY_ENDPOINT):
-            os.environ.pop("HF_ENDPOINT", None)
-            print("连通性测试结果: 主站可用，使用官方站点。")
-            return
+        return HF_MIRROR_ENDPOINT
+    print(f"连通性测试: 主站 {HF_PRIMARY_ENDPOINT}")
+    if _is_endpoint_reachable(HF_PRIMARY_ENDPOINT):
+        os.environ["HF_ENDPOINT"] = HF_PRIMARY_ENDPOINT
+        print("连通性测试结果: 主站可用，使用官方站点。")
+        return HF_PRIMARY_ENDPOINT
+    raise RuntimeError("镜像站和主站均不可达，请检查网络或通过 HF_ENDPOINT 指定站点。")
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
-    _configure_hf_endpoint_or_exit()
+    endpoint = _configure_hf_endpoint_or_exit(
+        HF_MIRROR_ENDPOINT if args.source == "hf-mirror" else None
+    )
     try:
         from huggingface_hub import HfApi
     except ImportError:
         print("Missing dependency: huggingface_hub. Please install it first.")
         return 1
 
-    api = HfApi(token=_get_token("hf"))
+    api = HfApi(endpoint=endpoint, token=_get_token("hf"))
     if args.type == "dataset":
         results = api.list_datasets(search=args.query, limit=args.limit)
         for ds in results:
@@ -244,7 +257,9 @@ def _build_download_tqdm_class(stats: dict):
 def _download_from_hf(
     args: argparse.Namespace, local_dir: str, token: str | None
 ) -> float:
-    _configure_hf_endpoint_or_exit()
+    endpoint = _configure_hf_endpoint_or_exit(
+        HF_MIRROR_ENDPOINT if args.source == "hf-mirror" else None
+    )
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -259,6 +274,7 @@ def _download_from_hf(
     progress_stats: dict = {"bytes": 0.0}
     download_kwargs = {
         "repo_id": args.repo_id,
+        "endpoint": endpoint,
         "repo_type": args.type,
         "local_dir": local_dir,
         "token": token,
@@ -408,6 +424,12 @@ def main() -> int:
         help="搜索类型 (model 或 dataset)",
     )
     search_parser.add_argument("--limit", type=int, default=20, help="显示结果数量限制")
+    search_parser.add_argument(
+        "--source",
+        choices=["hf", "hf-mirror"],
+        default="hf",
+        help="搜索源：hf 自动选择站点；hf-mirror 强制使用镜像，不回退（默认: hf）",
+    )
     search_parser.set_defaults(func=_cmd_search)
 
     # Download 命令
@@ -423,9 +445,9 @@ def main() -> int:
     )
     download_parser.add_argument(
         "--source",
-        choices=["hf", "modelscope"],
+        choices=["hf", "hf-mirror", "modelscope"],
         default="hf",
-        help="下载源（默认: hf）",
+        help="下载源：hf 自动选择站点；hf-mirror 强制使用镜像，不回退（默认: hf）",
     )
     download_parser.add_argument(
         "--max-workers",

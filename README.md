@@ -138,6 +138,20 @@ uv run python download.py download openai/gsm8k --type dataset
 uv run python download.py download Qwen/Qwen2.5-1.5B-Instruct --local-dir ./models/qwen
 ```
 
+强制使用 Hugging Face 镜像（不自动回退主站）：
+
+```bash
+uv run download.py download MiniMaxAI/MiniMax-H3 \
+  --source hf-mirror \
+  --local-dir /data/checkpoints
+```
+
+`search` 同样支持 `--source hf-mirror`。下载源选项：
+
+- `hf`（默认）：设置了 `HF_ENDPOINT` 时使用该地址；否则自动探测镜像，不可达时回退官方站。
+- `hf-mirror`：固定使用 `https://hf-mirror.com`，优先于 `HF_ENDPOINT`，失败则报错，不回退；认证沿用 HF Token。
+- `modelscope`：使用 ModelScope 安全下载器（仅下载命令支持）。
+
 ### ModelScope 大模型（安全续传）
 
 默认的 ModelScope SDK 在服务端忽略 `Range`、返回 HTTP 200 时，可能用 `wb` 打开已有 `.incomplete`，把十几 GB 进度截断归零。本仓库对 `--source modelscope` 使用独立安全下载器：
@@ -197,7 +211,7 @@ uv run python -m unittest tests.test_modelscope_safe_download -v
 
 - **认证（HF）**：`HUGGINGFACE_API_TOKEN`、`HUGGINGFACE_HUB_TOKEN` 或 `HF_TOKEN`
 - **认证（ModelScope）**：`MODELSCOPE_API_TOKEN` 或 `MODELSCOPE_TOKEN`；也可用 `download --token`
-- **镜像（HF）**：`HF_ENDPOINT`（默认探测 `https://hf-mirror.com`，不可达时回退官方站）
+- **站点（HF）**：`HF_ENDPOINT`（显式指定后不自动回退；未设置时默认探测 `https://hf-mirror.com`，不可达时回退官方站）
 - **默认下载目录**：`DEFAULT_MODEL_DIR`（模型，默认 `/etc/moreh/checkpoint/`）、`DEFAULT_DATA_DIR`（数据集，默认 `/etc/moreh/checkpoint/data/`）
 
 更多子命令说明可执行：
